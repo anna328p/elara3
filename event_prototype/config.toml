@@ -1,0 +1,13 @@
+triage_model = "claude-sonnet-5"
+sweep_model = "claude-sonnet-5"
+subagent_model = "claude-sonnet-5"
+
+# Writes the one-liners that represent deferred events back to triage.
+digest_model = "claude-haiku-4-5"
+
+db_path = "events.db"
+
+# Effort: low | medium | high | max. Nobody waits on the sweep and its calls are
+# the irreversible ones, so it gets more than the work it hands out.
+subagent_effort = "medium"
+sweep_effort = "high"

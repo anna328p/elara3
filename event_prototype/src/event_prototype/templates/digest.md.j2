@@ -1,0 +1,21 @@
+An event has been set aside for later. Write the one line that will stand in for
+it on the triage queue's backlog list.
+
+<event kind="{{ event.kind }}" priority="{{ event.priority }}">
+Received {{ event.age }}
+{{ event.description }}
+
+{{ event.payload }}
+</event>
+
+It was set aside because: {{ reason }}
+
+Triage reads this line for exactly one purpose: to notice when something newly
+arrived relates to something already set aside. So lead with the concrete
+subject — who is involved, what it concerns, what is left outstanding. Someone
+who has never seen the event should be able to tell from your line alone whether
+an incoming message is about the same thing.
+
+Write one line and nothing else: no preamble, no quotes, under 25 words. Do not
+say that it was deferred or why, and do not editorialise about its importance;
+that is not what this line is for.
