@@ -132,12 +132,26 @@ class PromptRenderer:
             now=now.isoformat(timespec="seconds"),
         )
 
-    def subagent(
-        self, rows: Sequence[EventRow], instructions: str, *, now: datetime | None = None
-    ) -> str:
+    # -- the subagent's conversation -----------------------------------------
+    #
+    # Three pieces rather than one prompt, because the subagent's context is a
+    # transcript that grows: the framing is the system prompt, stable across
+    # every call so the cache can hold it, and each event and each brief is a
+    # turn of its own.
+
+    def subagent_system(self) -> str:
+        return self._env.get_template("subagent_system.md.j2").render()
+
+    def event(self, row: EventRow, *, now: datetime | None = None) -> str:
+        """One event as a turn. The relative age freezes as of now, which is
+        right for a transcript; the absolute timestamp beside it disambiguates."""
         now = now or utcnow()
-        return self._env.get_template("subagent.md.j2").render(
-            events=[EventView.of(row, now) for row in rows],
-            instructions=instructions,
-            sequence=len(rows) > 1,
+        return self._env.get_template("subagent_event.md.j2").render(
+            event=EventView.of(row, now)
+        )
+
+    def brief(self, instructions: str, *, sequence: bool) -> str:
+        """Triage's instructions as a turn, following the events they cover."""
+        return self._env.get_template("subagent_brief.md.j2").render(
+            instructions=instructions, sequence=sequence
         )

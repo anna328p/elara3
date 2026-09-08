@@ -11,20 +11,22 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Coroutine, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 from anthropic import AsyncAnthropic
+from anthropic.types import Usage
 from mcp.server import MCPServer
 
 from .agents import Agent, AgentRole
 from .config import Config
+from .contexts import Turn
 from .digest import summarize
 from .events import Priority
 from .queue import EventQueue
 from .render import PromptRenderer
-from .store import EventRow, LogAction
-from .subagent import run_subagent
+from .store import ContextRow, EventRow, LogAction
+from .subagent import report_of, run_subagent
 
 #: How the models name a priority level, since the stored value is an integer.
 type PriorityName = Literal["background", "low", "normal", "high", "realtime"]
@@ -48,6 +50,10 @@ class Disposition:
     #: one means the assignment crossed streams — the case that will become a
     #: message between persistent contexts rather than one subagent reading both.
     streams: tuple[str, ...] = ()
+    #: The context the work went to, when the events all lay in one stream.
+    context_id: int | None = None
+    #: What the subagent's call cost, cache reads and writes included.
+    usage: Usage | None = None
 
 
 class Dispatcher:
@@ -93,13 +99,17 @@ class Dispatcher:
     async def assign(
         self, event_ids: Sequence[int], instructions: str, action: LogAction
     ) -> Agent:
-        """Hand events to a fresh subagent and start it working.
+        """Hand events to a subagent and start it working.
 
-        The assignment is logged before the task is spawned, so the record
-        exists even if handling never finishes.
+        Events that all lie in one stream go to that stream's context, and so
+        to the subagent whose context it is; the rest go to a fresh one-shot
+        subagent. The assignment is logged before the task is spawned, so the
+        record exists even if handling never finishes.
         """
         self._claim(event_ids, action)
-        subagent = Agent.spawn(AgentRole.SUBAGENT)
+        rows = await self.queue.get_many(event_ids)
+        context = await self._context_of(rows)
+        subagent = context.agent if context else Agent.spawn(AgentRole.SUBAGENT)
         await self.queue.assign(
             event_ids,
             agent=self.agent,
@@ -107,8 +117,22 @@ class Dispatcher:
             instructions=instructions,
             action=action,
         )
-        self._spawn(self._handle(event_ids, instructions, action, subagent))
+        self._spawn(self._handle(rows, instructions, action, subagent, context))
         return subagent
+
+    async def _context_of(self, rows: Sequence[EventRow]) -> ContextRow | None:
+        """The one context these events belong in, if they share a stream.
+
+        Crossing streams, or belonging to none, means no context: that is the
+        case that will become a message between two contexts, and until it is
+        built the work goes to a subagent that remembers nothing.
+        """
+        stream_ids = {row.stream_id for row in rows}
+        if len(stream_ids) != 1 or None in stream_ids:
+            return None
+        (stream_id,) = stream_ids
+        assert stream_id is not None
+        return await self.queue.context_for(stream_id)
 
     async def defer(self, event_id: int, reason: str) -> None:
         self._claim([event_id], LogAction.DEFER_EVENT)
@@ -159,35 +183,52 @@ class Dispatcher:
 
     async def _handle(
         self,
-        event_ids: Sequence[int],
+        rows: Sequence[EventRow],
         instructions: str,
         action: LogAction,
         subagent: Agent,
+        context: ContextRow | None,
     ) -> None:
-        """Run one subagent over `event_ids` and record what came back."""
-        ids = list(event_ids)
-        streams: tuple[str, ...] = ()
+        """Run one subagent over `rows` and record what came back.
+
+        With a context, the events and the brief are appended to it before the
+        call and the reply after, so the transcript is the record of what the
+        subagent was shown and what it said — a call that fails leaves the
+        events in it, which is what happened.
+        """
+        ids = [row.id for row in rows]
+        outcome = Disposition(
+            action,
+            ids,
+            instructions,
+            agent=subagent,
+            streams=_streams_of(rows),
+            context_id=context.id if context else None,
+        )
         try:
-            rows = await self.queue.get_many(ids)
-            streams = _streams_of(rows)
-            report = await run_subagent(
-                self.client, self.config, self.renderer, rows, instructions
+            turns = [Turn.user(self.renderer.event(row), event_id=row.id) for row in rows]
+            turns.append(Turn.user(self.renderer.brief(instructions, sequence=len(rows) > 1)))
+            if context:
+                await self.queue.append_turns(context.id, turns)
+                turns = [row.to_turn() for row in await self.queue.transcript(context.id)]
+            response = await run_subagent(
+                self.client,
+                self.config,
+                self.renderer.subagent_system(),
+                turns,
+                persistent=context is not None,
             )
+            if context:
+                await self.queue.append_turns(context.id, [Turn.of(response)])
+            report = report_of(response)
             await self.queue.complete(ids, agent=subagent, report=report)
         except Exception as exc:  # a failed subagent leaves its events for the next pass
             error = f"{type(exc).__name__}: {exc}"
             await self.queue.record_failure(ids, agent=subagent, error=error)
-            self.dispositions.append(
-                Disposition(
-                    action, ids, instructions, agent=subagent, error=error, streams=streams
-                )
-            )
+            self.dispositions.append(replace(outcome, error=error))
             return
-        self.dispositions.append(
-            Disposition(
-                action, ids, instructions, agent=subagent, report=report, streams=streams
-            )
-        )
+        self.dispositions.append(replace(outcome, report=report, usage=response.usage))
+
 
 def _streams_of(rows: Sequence[EventRow]) -> tuple[str, ...]:
     """The streams these events came from, first seen first, without repeats."""

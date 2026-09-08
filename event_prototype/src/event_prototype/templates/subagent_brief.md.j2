@@ -1,0 +1,10 @@
+Your brief from triage:
+
+{{ instructions }}
+{% if sequence %}
+
+Handle the events above in the order given; each may inform the next. Where two
+share a stream they are consecutive turns of one exchange; where they do not,
+the order is causal — what the earlier one establishes changes how the later one
+should be handled.
+{% endif %}

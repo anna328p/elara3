@@ -1,8 +1,9 @@
 """SQLite persistence for the event queue.
 
-Three tables: `events` is current state, `event_log` is the append-only record of
-what was decided about each one and by whom, and `streams` is the ongoing
-contexts events belong to. Rows are never deleted — archiving stamps
+`events` is current state and `event_log` the append-only record of what was
+decided about each one and by whom. `streams` is the ongoing loci events belong
+to, each routed to at most one `contexts` row: the conversation an agent is
+having there, stored as `turns`. Rows are never deleted — archiving stamps
 `archived_at` and every default query filters those out, so the audit trail
 stays intact.
 """
@@ -31,6 +32,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.pool import StaticPool
 
 from .agents import Agent, AgentRole
+from .contexts import Block, Role, Turn
 from .events import BaseEvent, Priority, from_payload
 from .streams import StreamKind, StreamRef
 
@@ -107,7 +109,7 @@ class StreamRow(Base):
     Identity is `(kind, key)`; the surrogate id is what `events.stream_id`
     points at. There is deliberately no cached "last event" column — that is
     `max(events.timestamp)`, and a cached copy would only be another thing to
-    keep true. This is also where a persistent subagent context will attach.
+    keep true.
     """
 
     __tablename__ = "streams"
@@ -121,12 +123,87 @@ class StreamRow(Base):
     key: Mapped[str] = mapped_column(String(255))
     title: Mapped[str]
 
+    #: Where work in this stream goes: the one live context, opened on the
+    #: first assignment and kept thereafter. Several streams may point at the
+    #: same context; re-pointing is how a stream moves to a fresh one. A plain
+    #: column rather than a relationship, so it rides along on the join
+    #: `EventRow.stream` already makes without fanning that query out further.
+    context_id: Mapped[int | None] = mapped_column(
+        ForeignKey("contexts.id"), default=None
+    )
+
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
     #: Touched every time an event joins, so this doubles as "last seen".
     updated_at: Mapped[datetime] = mapped_column(default=utcnow, onupdate=utcnow)
 
     def __repr__(self) -> str:
         return f"StreamRow(id={self.id}, kind={self.kind.value}, key={self.key!r})"
+
+
+class ContextRow(Base):
+    """A conversation an agent is having, replayable as one Messages API call."""
+
+    __tablename__ = "contexts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+
+    #: Whose conversation this is. Minted when the context opens and kept, so
+    #: returning work in a stream reaches the same subagent — the identity in
+    #: the event log and the memory in the transcript are the same thing.
+    agent_id: Mapped[str] = mapped_column(String(36))
+    agent_role: Mapped[AgentRole] = mapped_column(
+        SAEnum(AgentRole, native_enum=False, length=16)
+    )
+
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+    #: Touched whenever a turn is appended.
+    updated_at: Mapped[datetime] = mapped_column(default=utcnow, onupdate=utcnow)
+
+    @property
+    def agent(self) -> Agent:
+        return Agent(self.agent_role, self.agent_id)
+
+    def __repr__(self) -> str:
+        return f"ContextRow(id={self.id}, agent={self.agent.label!r})"
+
+
+class TurnRow(Base):
+    """One message in a context. Append-only, ordered by id."""
+
+    __tablename__ = "turns"
+    __table_args__ = (
+        # The one read is "this context's transcript, in order".
+        Index("ix_turns_context", "context_id", "id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    context_id: Mapped[int] = mapped_column(ForeignKey("contexts.id"))
+    timestamp: Mapped[datetime] = mapped_column(default=utcnow)
+
+    role: Mapped[Role] = mapped_column(SAEnum(Role, native_enum=False, length=16))
+    #: Anthropic content blocks, verbatim. Always a list, never a bare string,
+    #: so there is one shape to read back.
+    content: Mapped[list[Block]] = mapped_column(JSON, default=list)
+
+    #: The event that occasioned this turn, when one did.
+    event_id: Mapped[int | None] = mapped_column(
+        ForeignKey("events.id"), index=True, default=None
+    )
+
+    @classmethod
+    def of(cls, context_id: int, turn: Turn) -> TurnRow:
+        return cls(
+            context_id=context_id,
+            role=turn.role,
+            content=list(turn.content),
+            event_id=turn.event_id,
+        )
+
+    def to_turn(self) -> Turn:
+        return Turn(self.role, tuple(self.content), self.event_id)
+
+    def __repr__(self) -> str:
+        return f"TurnRow(id={self.id}, context_id={self.context_id}, role={self.role.value})"
 
 
 class EventRow(Base):
@@ -238,6 +315,36 @@ async def resolve_stream(session: AsyncSession, ref: StreamRef) -> int:
     if stream_id is None:  # RETURNING on an upsert always yields exactly one row
         raise RuntimeError(f"stream upsert returned nothing for {ref.key!r}")
     return stream_id
+
+
+class StreamNotFound(KeyError):
+    """No stream with that id."""
+
+
+async def resolve_context(session: AsyncSession, stream_id: int) -> ContextRow:
+    """The context `stream_id` routes to, opened on first need.
+
+    Opening mints the subagent whose context it will be and points the stream
+    at it, all in the caller's transaction. Two writers opening one stream's
+    context at the same moment would leave an orphan; the dispatcher resolves
+    contexts from the pass's tool calls, which run one at a time, so that does
+    not arise within a process.
+    """
+    stream = await session.get(StreamRow, stream_id)
+    if stream is None:
+        raise StreamNotFound(f"no such stream: {stream_id}")
+    if stream.context_id is not None:
+        context = await session.get(ContextRow, stream.context_id)
+        if context is None:  # the foreign key says otherwise
+            raise RuntimeError(f"stream {stream_id} routes to a missing context")
+        return context
+
+    agent = Agent.spawn(AgentRole.SUBAGENT)
+    context = ContextRow(agent_id=agent.id, agent_role=agent.role)
+    session.add(context)
+    await session.flush()  # for its id
+    stream.context_id = context.id
+    return context
 
 
 def create_engine(db_path: Path | str) -> AsyncEngine:

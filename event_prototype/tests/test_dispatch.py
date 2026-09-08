@@ -14,7 +14,7 @@ from event_prototype.render import PromptRenderer
 from event_prototype.store import LogAction, Status, utcnow
 from event_prototype.tools import Dispatcher
 
-from conftest import message
+from conftest import FakeMessages, message
 
 
 def dispatcher(queue: EventQueue, role: AgentRole = AgentRole.TRIAGE) -> Dispatcher:
@@ -61,20 +61,6 @@ async def test_a_rejected_disposition_leaves_the_batch_untouched(
     assert (await queue.get(second)).status is Status.DEFERRED
 
 
-class FakeMessages:
-    """Stands in for `client.messages`, returning a fixed one-liner."""
-
-    def __init__(self, text: str) -> None:
-        self.text = text
-        self.calls = 0
-
-    async def create(self, **kwargs: object) -> SimpleNamespace:
-        self.calls += 1
-        return SimpleNamespace(
-            content=[SimpleNamespace(type="text", text=self.text)], stop_reason="end_turn"
-        )
-
-
 async def test_setting_an_event_aside_writes_its_backlog_line(queue: EventQueue) -> None:
     event_id = await queue.submit(message(), Priority.LOW)
     messages = FakeMessages("  mira asked about\n  the gradient banding  ")
@@ -85,7 +71,7 @@ async def test_setting_an_event_aside_writes_its_backlog_line(queue: EventQueue)
     assert (await queue.get(event_id)).digest is None  # not written inline...
     await triage.drain()  # ...it is spawned alongside the subagents
 
-    assert messages.calls == 1
+    assert len(messages.calls) == 1
     # However the model lays it out, the backlog line is one line.
     assert (await queue.get(event_id)).digest == "mira asked about the gradient banding"
 

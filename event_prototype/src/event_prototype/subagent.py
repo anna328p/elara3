@@ -1,15 +1,14 @@
-"""The subagent side: one larger model handling the events triage assigned it."""
+"""The subagent side: one larger model continuing the conversation it was handed."""
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable
 
-from anthropic import AsyncAnthropic
+from anthropic import AsyncAnthropic, omit
 from anthropic.types import Message
 
 from .config import Config
-from .render import PromptRenderer
-from .store import EventRow
+from .contexts import Turn, to_api
 
 MAX_TOKENS = 16000
 
@@ -17,29 +16,36 @@ MAX_TOKENS = 16000
 async def run_subagent(
     client: AsyncAnthropic,
     config: Config,
-    renderer: PromptRenderer,
-    rows: Sequence[EventRow],
-    instructions: str,
-) -> str:
-    """Hand `rows` to a subagent and return its account of what it did.
+    system: str,
+    turns: Iterable[Turn],
+    *,
+    persistent: bool,
+) -> Message:
+    """One completion over `turns`, returned whole.
 
-    Recording the outcome is the dispatcher's job; this only does the work.
+    Recording the reply and the outcome is the dispatcher's job; this only does
+    the work. In the real framework this would be a full agent loop with tools;
+    here it is a single call, which is enough to exercise the dispatch path.
 
-    In the real framework this would be a full agent with its own event loop and
-    tools; here it is a single call, which is enough to exercise the dispatch path.
+    A persistent context asks for caching. The request-level marker puts the
+    breakpoint on the last block sent, and the API looks back from there for the
+    prefix the previous call wrote — so each call in a stream reads the last one
+    and caches through its own. A one-shot conversation has no next call, so it
+    does not pay the write.
     """
-    response = await client.messages.create(
+    return await client.messages.create(
         model=config.subagent_model,
         max_tokens=MAX_TOKENS,
         thinking={"type": "adaptive"},
         output_config={"effort": config.subagent_effort},
-        messages=[{"role": "user", "content": renderer.subagent(rows, instructions)}],
+        system=system,
+        messages=to_api(turns),
+        cache_control={"type": "ephemeral"} if persistent else omit,
     )
-    return _text_of(response)
 
 
-def _text_of(response: Message) -> str:
-    """The visible text of a response, ignoring thinking blocks."""
+def report_of(response: Message) -> str:
+    """What the subagent said it did, as the event log records it."""
     if response.stop_reason == "refusal":
         return "[subagent declined to handle this event]"
-    return "\n".join(block.text for block in response.content if block.type == "text").strip()
+    return Turn.of(response).text

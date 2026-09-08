@@ -20,15 +20,20 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from .agents import Agent
+from .contexts import Turn
 from .events import Event, Priority
 from .store import (
+    ContextRow,
     EventLogRow,
     EventRow,
     LogAction,
     Status,
+    StreamNotFound,
     StreamRow,
+    TurnRow,
     create_engine,
     init_schema,
+    resolve_context,
     resolve_stream,
     session_factory,
     utcnow,
@@ -68,6 +73,8 @@ class StreamSummary:
     stream: StreamRow
     active: int
     last_event_at: datetime | None
+    #: How long the conversation in its context has grown. Zero without one.
+    turns: int
 
 
 class EventQueue:
@@ -294,20 +301,64 @@ class EventQueue:
             EventRow.archived_at.is_(None), EventRow.status != Status.COMPLETED
         )
         last_event_at = func.max(EventRow.timestamp)
+        # Counted apart from the events join, or the two would multiply.
+        turns = (
+            select(TurnRow.context_id, func.count(TurnRow.id).label("turns"))
+            .group_by(TurnRow.context_id)
+            .subquery()
+        )
+        turn_count = func.coalesce(turns.c.turns, 0)
         query = (
-            select(StreamRow, active, last_event_at)
+            select(StreamRow, active, last_event_at, turn_count)
             .outerjoin(EventRow, EventRow.stream_id == StreamRow.id)
-            .group_by(StreamRow.id)
+            .outerjoin(turns, turns.c.context_id == StreamRow.context_id)
+            .group_by(StreamRow.id, turns.c.turns)
             .order_by(last_event_at.desc())
         )
         async with self._sessions() as session:
             rows = (await session.execute(query)).all()
-        return [StreamSummary(stream, count, last) for stream, count, last in rows]
+        return [
+            StreamSummary(stream, count, last, turns)
+            for stream, count, last, turns in rows
+        ]
 
     async def history_for(self, event_ids: Sequence[int]) -> History:
         """Log entries for these events, oldest first. One query."""
         async with self._sessions() as session:
             return await self._history(session, event_ids)
+
+    # -- contexts ----------------------------------------------------------
+
+    async def get_stream(self, stream_id: int) -> StreamRow:
+        async with self._sessions() as session:
+            stream = await session.get(StreamRow, stream_id)
+            if stream is None:
+                raise StreamNotFound(f"no such stream: {stream_id}")
+            return stream
+
+    async def context_for(self, stream_id: int) -> ContextRow:
+        """The context a stream's work goes to, opened if this is its first."""
+        async with self._sessions.begin() as session:
+            return await resolve_context(session, stream_id)
+
+    async def append_turns(self, context_id: int, turns: Sequence[Turn]) -> None:
+        """Add turns to a context, in order, as one transaction."""
+        async with self._sessions.begin() as session:
+            context = await session.get(ContextRow, context_id)
+            if context is None:
+                raise KeyError(f"no such context: {context_id}")
+            context.updated_at = utcnow()
+            session.add_all(TurnRow.of(context_id, turn) for turn in turns)
+
+    async def transcript(self, context_id: int) -> list[TurnRow]:
+        """Every turn in a context, oldest first. One query."""
+        query = (
+            select(TurnRow)
+            .where(TurnRow.context_id == context_id)
+            .order_by(TurnRow.id.asc())
+        )
+        async with self._sessions() as session:
+            return list((await session.scalars(query)).all())
 
     # -- internals ---------------------------------------------------------
 

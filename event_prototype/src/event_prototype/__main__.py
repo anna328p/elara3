@@ -10,11 +10,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .config import DEFAULT_CONFIG_PATH, Config
+from .contexts import Block
 from .fixtures import seed
 from .queue import EventQueue
 from .render import PromptRenderer
 
 if TYPE_CHECKING:
+    from anthropic.types import Usage
+
     from .runner import PassResult
 
 
@@ -35,7 +38,10 @@ def main() -> None:
         "--all", action="store_true", help="include completed and archived events"
     )
 
-    sub.add_parser("streams", help="show the ongoing contexts events belong to")
+    sub.add_parser("streams", help="show the ongoing loci events belong to")
+
+    context_cmd = sub.add_parser("context", help="show the conversation a stream routes to")
+    context_cmd.add_argument("stream_id", type=int, help="the stream's id, from `streams`")
 
     for name, help_text in (
         ("triage", "decide what the pending events need"),
@@ -64,6 +70,8 @@ async def _dispatch(args: argparse.Namespace, config: Config) -> None:
             await _list(config, show_all=args.all)
         case "streams":
             await _streams(config)
+        case "context":
+            await _context(config, args.stream_id)
         case "triage" | "sweep" as which:
             await _pass(config, which, dry_run=args.dry_run)
         case unknown:  # argparse rejects anything else first
@@ -111,10 +119,52 @@ async def _streams(config: Config) -> None:
     for summary in summaries:
         last = summary.last_event_at
         seen = last.isoformat(timespec="seconds") if last else "never"
+        context = summary.stream.context_id
+        routed = (
+            f"context {context} ({_plural(summary.turns, 'turn')})"
+            if context is not None
+            else "no context"
+        )
         print(
             f"[{summary.stream.id:>3}] {summary.stream.kind.value:<8} "
-            f"{summary.stream.title:<26} {summary.active:>2} active   last {seen}"
+            f"{summary.stream.title:<26} {summary.active:>2} active   last {seen}   {routed}"
         )
+
+
+async def _context(config: Config, stream_id: int) -> None:
+    async with await EventQueue.open(config.db_path) as queue:
+        stream = await queue.get_stream(stream_id)
+        if stream.context_id is None:
+            print(f"{stream.title} has no context yet: nothing has been assigned in it.")
+            return
+        turns = await queue.transcript(stream.context_id)
+
+    print(f"{stream.title} → context {stream.context_id}, {_plural(len(turns), 'turn')}\n")
+    for turn in turns:
+        stamp = turn.timestamp.isoformat(timespec="seconds")
+        about = f"  (event {turn.event_id})" if turn.event_id is not None else ""
+        print(f"--- {turn.role.value} {stamp}{about}")
+        for block in turn.content:
+            print(textwrap.indent(_show_block(block), "    "))
+        print()
+
+
+def _show_block(block: Block) -> str:
+    """A content block as a reader wants it: text in full, the rest by shape."""
+    match block:
+        case {"type": "text", "text": str(text)}:
+            return text
+        case {"type": "thinking", "thinking": str(thinking)}:
+            return f"[thinking, {len(thinking.split())} words]"
+        case {"type": "tool_use", "name": str(name), "id": str(call_id)}:
+            return f"[tool_use {name} #{call_id}]"
+        case {"type": "tool_result", "tool_use_id": str(call_id)}:
+            return f"[tool_result for #{call_id}]"
+        case {"type": str(kind)}:
+            return f"[{kind}]"
+        case _:
+            return "[unknown block]"
+
 
 async def _pass(config: Config, which: str, *, dry_run: bool) -> None:
     """Run a triage or sweep pass, or just show the prompt it would send."""
@@ -157,6 +207,14 @@ def _plural(count: int, noun: str) -> str:
     return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
 
 
+def _show_usage(usage: Usage) -> str:
+    """Input tokens with how many the cache served, since that is the point."""
+    read = usage.cache_read_input_tokens or 0
+    written = usage.cache_creation_input_tokens or 0
+    total = usage.input_tokens + read + written
+    return f"{total} in: {read} cached, {written} newly cached; {usage.output_tokens} out"
+
+
 def _report(result: PassResult) -> None:
     considered, dispositions = result.considered, result.dispositions
     print(
@@ -175,6 +233,9 @@ def _report(result: PassResult) -> None:
             print(textwrap.indent(f"FAILED: {disposition.error}", "    "))
         elif disposition.report:
             print(textwrap.indent(textwrap.fill(disposition.report, 84), "  > "))
+        if disposition.usage:
+            where = f"context {disposition.context_id}, " if disposition.context_id else ""
+            print(f"    [{where}{_show_usage(disposition.usage)}]")
         print()
 
     if missed := [row.id for row in considered if row.id not in result.dispatched_ids]:

@@ -13,10 +13,11 @@ uv run pytest
 
 uv run python -m event_prototype seed --fresh   # a dozen synthetic events
 uv run python -m event_prototype list
-uv run python -m event_prototype streams        # the ongoing contexts they belong to
+uv run python -m event_prototype streams        # the ongoing loci they belong to
 uv run python -m event_prototype triage --dry-run   # the prompt, no API call
 uv run python -m event_prototype triage             # the real thing
 uv run python -m event_prototype sweep              # reconsider the backlog
+uv run python -m event_prototype context 1      # the conversation stream 1 routes to
 ```
 
 The live passes need `ANTHROPIC_API_KEY`, read from the `.env` at the repo root.
@@ -80,11 +81,11 @@ The prompts show the stream as an attribute on each event, which sharpens
 happened, not what it is about, so sharing one is a reason to look for a
 connection and not evidence of one — and the clearest reason to group events
 runs the other way, across streams, as when a job's result answers a question
-someone asked somewhere else. That case is why the tool keeps its shape, and it
-is where persistent contexts will land: once a subagent is a stream's long-lived
-cached context, a same-stream sequence means handing work to that context and a
-cross-stream one means a message between two. The pass report prints the streams
-each assignment spanned, so a crossing is visible when it happens.
+someone asked somewhere else. That case is why the tool keeps its shape: a
+same-stream assignment hands work to the stream's context (next section), and a
+cross-stream one will become a message between two contexts. The pass report
+prints the streams each assignment spanned, so a crossing is visible when it
+happens.
 
 Streams capture the locus, not the topic. A `#general` mention and a later DM
 from the same person are different streams, so it is still the digest line that
@@ -102,14 +103,58 @@ revisited freely — that is the point.
 The MCP servers run in-process, connected over an in-memory transport: the same
 protocol as a remote server, minus the subprocess.
 
+## Contexts
+
+A context is the conversation an agent is having, stored as a series of turns
+and replayed as a Messages API call. Each stream routes to at most one live
+context, opened on the first assignment in that stream and kept from then on;
+several streams may share one, and re-pointing a stream is how it moves to a
+fresh context when the old one is collapsed. The context owns the subagent's
+identity, so an assignment in a stream that already has one goes to the same
+subagent that handled it before, with everything it was shown and everything it
+said still in front of it. `context <stream-id>` prints that transcript.
+
+A turn is exactly one API message: a role and a list of the API's own content
+blocks, kept verbatim. That is what lets tool calls live in the same record
+without a side table. A call is a `tool_use` block in an assistant turn and its
+result a `tool_result` block in the user turn that follows, so storing messages
+whole keeps every pair intact, along with the signatures on thinking blocks that
+the API checks on replay. Tool definitions are not stored; like the system
+prompt, they are invariants supplied at call time. A turn may carry the id of the
+event that occasioned it, and the events and the brief that triage sends are
+each a turn of their own with that link, while the subagent's reply has none.
+
+Replay (`contexts.to_api`) is where the API's rules are met rather than the
+store's: consecutive same-role turns merge into one message because roles must
+alternate, tool results go first within a merged user message, and a transcript
+whose last turn holds unanswered tool calls is refused, since that is the agent
+waiting on results and not something the API will continue. Nothing about
+caching is written into a turn; the request asks for it, so the bytes sent are
+the bytes stored.
+
+Caching works on the prefix. The subagent's framing is the system prompt and
+never changes, each event and brief is a new turn at the end, and the request
+carries a top-level cache marker that lands on the last block sent. The API
+looks back from there for the prefix the previous call wrote, so each call in a
+stream reads the last one and caches through its own; the pass report prints
+the cached and newly cached input tokens for every subagent call. Two limits are
+worth knowing. A prefix under 1024 tokens (2048 on Haiku) is not cached at all,
+so a stream's first exchange or two silently pay full price, and the default
+entry lives five minutes, so the saving lands within a burst of activity rather
+than across the hours between bursts; the one-hour option exists and is a
+decision to make with numbers. Assignments that cross streams, or belong to
+none, still go to a one-shot subagent with a single-turn conversation and ask
+for no caching, since nothing will read it back.
+
 ## Shape of the code
 
 | module | what it holds |
 | --- | --- |
 | `events.py` | the `Event` protocol, `Priority`, and the concrete kinds |
 | `agents.py` | agent identity: a role and a UUID, minted when an agent starts |
-| `streams.py` | stream identity: the kind of context, its key and its label |
-| `store.py` | the three SQLAlchemy rows and engine setup |
+| `streams.py` | stream identity: the kind of locus, its key and its label |
+| `contexts.py` | a turn, and the transform from a transcript to an API message list |
+| `store.py` | the five SQLAlchemy rows, the two resolvers, and engine setup |
 | `queue.py` | `EventQueue`: submit, edit, the dispositions, and the two views |
 | `render.py` + `templates/` | rows → prompts |
 | `tools.py` | the two tool sets and the dispatcher they act on |
@@ -130,10 +175,17 @@ subagent the work went to, so a dispatch and the report that follows it can be
 tied together. State changes and their log rows are written in the same
 transaction, so status and reasoning can never disagree.
 
-`streams` holds identity only. It caches neither a last-activity stamp nor an
-event count: both are aggregates over `events`, and the listing needs a GROUP BY
-anyway, so a cached copy would be one more thing that can be wrong — and would
-be, since events do not arrive in the order they happened.
+`streams` holds identity and routing: which context, if any, work in the stream
+goes to. It caches neither a last-activity stamp nor an event count: both are
+aggregates over `events`, and the listing needs a GROUP BY anyway, so a cached
+copy would be one more thing that can be wrong — and would be, since events do
+not arrive in the order they happened.
+
+`contexts` holds the agent whose conversation it is, and `turns` the
+conversation, ordered by id within a context in the same way `event_log` is
+ordered within an event. Turns are appended before the subagent is called and
+after it replies, so a call that fails leaves the events it was shown in the
+transcript, which is what happened; the failure itself goes to the event log.
 
 Reads are indexed on `(event_id, timestamp)` and never go per-event. Triage is a
 single query, since the digest needs no history at all; the sweep is two, one for
@@ -149,7 +201,10 @@ both passes, but `list --all` still shows it, log and all.
 ## What it doesn't do
 
 Subagents are a single model call with no tools, so they describe how they would
-handle an event rather than doing it. There is no heartbeat, so the sweep is a
+handle an event rather than doing it; the transcript can hold a tool loop, but
+nothing runs one. Contexts only grow: there is no collapse or compaction, and no
+message from one context to another, so a cross-stream assignment still goes to
+a subagent that remembers nothing. There is no heartbeat, so the sweep is a
 command you run rather than something that fires on idle time or a backlog
 threshold, and nothing yet decides when a pass should happen. No token budgets,
 and no subagent-of-a-subagent — those come with the real framework.

@@ -1,0 +1,6 @@
+<event id="{{ event.id }}" kind="{{ event.kind }}" priority="{{ event.priority }}"{% if event.stream %} stream="{{ event.stream }}"{% endif %}>
+Received {{ event.age }} ({{ event.timestamp }})
+{{ event.description }}
+
+{{ event.payload }}
+</event>
