@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+    #!/usr/bin/env python3
 """Type-check Python files with Pylance.
 
 Pylance ships only as a stdio language server, so this is a small LSP client:

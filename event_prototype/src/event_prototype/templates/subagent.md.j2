@@ -1,7 +1,7 @@
 You are a subagent in an agent framework, handling {% if sequence %}a group of related events{% else %}one event{% endif %} that triage assigned to you.
 
 {% for event in events %}
-<event id="{{ event.id }}" kind="{{ event.kind }}" priority="{{ event.priority }}">
+<event id="{{ event.id }}" kind="{{ event.kind }}" priority="{{ event.priority }}"{% if event.stream %} stream="{{ event.stream }}"{% endif %}>
 Received {{ event.age }} ({{ event.timestamp }})
 {{ event.description }}
 
@@ -14,7 +14,10 @@ Your brief from triage:
 {{ instructions }}
 
 {% if sequence %}
-Handle the events in the order given above; each may inform the next.
+Handle the events in the order given above; each may inform the next. Where two
+share a stream they are consecutive turns of one exchange; where they do not,
+the order is causal — what the earlier one establishes changes how the later one
+should be handled.
 {% endif %}
 You have no tools in this prototype, so describe the handling concretely: what
 you did or would do, and any text you would send on the character's behalf.

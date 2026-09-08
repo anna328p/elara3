@@ -2,39 +2,18 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import pytest
 
 from event_prototype.agents import Agent, AgentRole
-from event_prototype.events import JobEvent, MessageEvent, Priority, ScheduledEvent
+from event_prototype.events import JobEvent, Priority, ScheduledEvent
 from event_prototype.queue import EventNotFound, EventQueue
-from event_prototype.store import IN_MEMORY, LogAction, Status, utcnow
+from event_prototype.store import LogAction, Status, utcnow
+
+from conftest import message
 
 TRIAGE = Agent.spawn(AgentRole.TRIAGE)
-
-
-@pytest.fixture
-async def queue() -> AsyncIterator[EventQueue]:
-    async with await EventQueue.open(IN_MEMORY) as queue:
-        yield queue
-
-
-def message(
-    body: str = "hello",
-    *,
-    timestamp: datetime | None = None,
-    description: str = "a message",
-    sender: str = "mira",
-) -> MessageEvent:
-    return MessageEvent(
-        timestamp=timestamp or utcnow(),
-        description=description,
-        sender=sender,
-        channel="#workshop",
-        body=body,
-    )
 
 
 async def test_submit_round_trips_a_typed_event(queue: EventQueue) -> None:

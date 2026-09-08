@@ -35,6 +35,8 @@ def main() -> None:
         "--all", action="store_true", help="include completed and archived events"
     )
 
+    sub.add_parser("streams", help="show the ongoing contexts events belong to")
+
     for name, help_text in (
         ("triage", "decide what the pending events need"),
         ("sweep", "reconsider the deferred backlog"),
@@ -60,6 +62,8 @@ async def _dispatch(args: argparse.Namespace, config: Config) -> None:
             await _seed(config, fresh=args.fresh)
         case "list":
             await _list(config, show_all=args.all)
+        case "streams":
+            await _streams(config)
         case "triage" | "sweep" as which:
             await _pass(config, which, dry_run=args.dry_run)
         case unknown:  # argparse rejects anything else first
@@ -85,15 +89,32 @@ async def _list(config: Config, *, show_all: bool) -> None:
         return
 
     for row in rows:
+        stream = row.stream.title if row.stream else "—"
         print(
             f"[{row.id:>3}] {row.priority.name.lower():<10} {row.kind:<9} "
-            f"{row.status.value:<9} {row.description}"
+            f"{row.status.value:<9} {stream:<22} {row.description}"
         )
         for entry in history.get(row.id, []):
             stamp = entry.timestamp.isoformat(timespec="seconds")
             print(f"        {stamp} {entry.action.value} by {entry.agent.label}")
             print(textwrap.indent(textwrap.fill(entry.detail, 80), " " * 12))
 
+
+async def _streams(config: Config) -> None:
+    async with await EventQueue.open(config.db_path) as queue:
+        summaries = await queue.list_streams()
+
+    if not summaries:
+        print("No streams yet.")
+        return
+
+    for summary in summaries:
+        last = summary.last_event_at
+        seen = last.isoformat(timespec="seconds") if last else "never"
+        print(
+            f"[{summary.stream.id:>3}] {summary.stream.kind.value:<8} "
+            f"{summary.stream.title:<26} {summary.active:>2} active   last {seen}"
+        )
 
 async def _pass(config: Config, which: str, *, dry_run: bool) -> None:
     """Run a triage or sweep pass, or just show the prompt it would send."""
@@ -146,7 +167,9 @@ def _report(result: PassResult) -> None:
     for disposition in dispositions:
         listed = ", ".join(str(i) for i in disposition.event_ids)
         actor = f"  [{disposition.agent.label}]" if disposition.agent else ""
-        print(f"{disposition.action.value}({listed}){actor}")
+        # More than one stream means the assignment crossed contexts.
+        spans = f"  {' → '.join(disposition.streams)}" if disposition.streams else ""
+        print(f"{disposition.action.value}({listed}){spans}{actor}")
         print(textwrap.indent(textwrap.fill(disposition.detail, 84), "    "))
         if disposition.error:
             print(textwrap.indent(f"FAILED: {disposition.error}", "    "))

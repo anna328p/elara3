@@ -2,36 +2,15 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Generator
-from contextlib import contextmanager
-
-import pytest
-from sqlalchemy import event as sa_event
-from sqlalchemy.engine import Engine
-
 from event_prototype.agents import Agent, AgentRole
-from event_prototype.events import MessageEvent, Priority
+from event_prototype.events import Priority
 from event_prototype.queue import EventQueue
 from event_prototype.render import PromptRenderer
-from event_prototype.store import IN_MEMORY, LogAction, Status, utcnow
+from event_prototype.store import LogAction, Status
+
+from conftest import counting_selects, message
 
 TRIAGE = Agent.spawn(AgentRole.TRIAGE)
-
-
-@pytest.fixture
-async def queue() -> AsyncIterator[EventQueue]:
-    async with await EventQueue.open(IN_MEMORY) as queue:
-        yield queue
-
-
-def message(body: str = "hello") -> MessageEvent:
-    return MessageEvent(
-        timestamp=utcnow(),
-        description="a message",
-        sender="mira",
-        channel="#workshop",
-        body=body,
-    )
 
 
 async def test_an_events_history_reads_as_a_sequence(queue: EventQueue) -> None:
@@ -90,29 +69,6 @@ async def test_failure_is_recorded_and_leaves_the_event_alone(queue: EventQueue)
     (entry,) = (await queue.history_for([event_id]))[event_id]
     assert entry.action is LogAction.FAILED
     assert "boom" in entry.detail
-
-
-@contextmanager
-def counting_selects() -> Generator[list[str], None, None]:
-    """Every SELECT issued inside the block."""
-    statements: list[str] = []
-
-    @sa_event.listens_for(Engine, "before_cursor_execute")
-    def record(
-        conn: object,
-        cursor: object,
-        statement: str,
-        parameters: object,
-        context: object,
-        executemany: bool,
-    ) -> None:
-        if statement.lstrip().upper().startswith("SELECT"):
-            statements.append(statement)
-
-    try:
-        yield statements
-    finally:
-        sa_event.remove(Engine, "before_cursor_execute", record)
 
 
 async def test_sweep_fetches_history_without_a_query_per_event(

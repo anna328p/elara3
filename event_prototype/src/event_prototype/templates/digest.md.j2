@@ -1,7 +1,7 @@
 An event has been set aside for later. Write the one line that will stand in for
 it on the triage queue's backlog list.
 
-<event kind="{{ event.kind }}" priority="{{ event.priority }}">
+<event kind="{{ event.kind }}" priority="{{ event.priority }}"{% if event.stream %} stream="{{ event.stream }}"{% endif %}>
 Received {{ event.age }}
 {{ event.description }}
 
@@ -18,4 +18,5 @@ an incoming message is about the same thing.
 
 Write one line and nothing else: no preamble, no quotes, under 25 words. Do not
 say that it was deferred or why, and do not editorialise about its importance;
-that is not what this line is for.
+that is not what this line is for. The stream is displayed beside your line, so
+spend no words naming the room or the job — say what is outstanding in it.

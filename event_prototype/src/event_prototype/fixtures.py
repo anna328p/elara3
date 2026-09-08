@@ -15,7 +15,11 @@ from .store import utcnow
 
 
 def synthetic_events() -> list[tuple[BaseEvent, Priority]]:
-    """Ten events, timed relative to now so their ages read sensibly."""
+    """A dozen events, timed relative to now so their ages read sensibly.
+
+    Submitted out of chronological order on purpose: a stream's last activity
+    is the newest event on it, not the one that happened to be queued last.
+    """
     now = utcnow()
 
     def ago(**kwargs: float) -> datetime:
@@ -27,7 +31,8 @@ def synthetic_events() -> list[tuple[BaseEvent, Priority]]:
                 timestamp=ago(seconds=40),
                 description="Mira is mid-conversation in #workshop and just asked a direct question",
                 sender="mira",
-                channel="#workshop",
+                venue="discord",
+                conversation="#workshop",
                 body="wait, so did the render finish or did it choke on the alpha channel again?",
             ),
             Priority.REALTIME,
@@ -36,6 +41,7 @@ def synthetic_events() -> list[tuple[BaseEvent, Priority]]:
             JobEvent(
                 timestamp=ago(minutes=2),
                 description="Overnight render job finished",
+                # A one-off render, so it belongs to no stream.
                 job_id="render-0412",
                 outcome="succeeded",
                 summary=(
@@ -51,6 +57,7 @@ def synthetic_events() -> list[tuple[BaseEvent, Priority]]:
                 description="Reminder fired: post the weekly devlog",
                 fires_at=ago(minutes=3),
                 note="Post the devlog before Friday evening. Draft is in workspace notes.",
+                schedule="weekly-devlog",
             ),
             Priority.HIGH,
         ),
@@ -59,11 +66,13 @@ def synthetic_events() -> list[tuple[BaseEvent, Priority]]:
                 timestamp=ago(minutes=12),
                 description="Direct message from Tobias asking about collaborating",
                 sender="tobias",
-                channel="dm",
+                venue="discord",
+                conversation="dm:tobias",
                 body=(
                     "hey — liked the piece you posted last week. any interest in doing "
                     "something together for the winter showcase? deadline is the 30th."
                 ),
+                direct=True,
             ),
             Priority.HIGH,
         ),
@@ -72,10 +81,25 @@ def synthetic_events() -> list[tuple[BaseEvent, Priority]]:
                 timestamp=ago(minutes=9),
                 description="Follow-up from Tobias with the details he forgot",
                 sender="tobias",
-                channel="dm",
+                venue="discord",
+                conversation="dm:tobias",
                 body="forgot to say: submissions are max 3 minutes, and they want a rough cut by the 20th.",
+                direct=True,
             ),
             Priority.NORMAL,
+        ),
+        (
+            # Same stream as Mira's question, and nothing to do with it: sharing
+            # a stream is not on its own a reason to handle two events together.
+            MessageEvent(
+                timestamp=ago(minutes=20),
+                description="Passing remark in #workshop, no question in it",
+                sender="hal",
+                venue="discord",
+                conversation="#workshop",
+                body="the new brush engine update broke my pressure curves btw",
+            ),
+            Priority.LOW,
         ),
         (
             ScheduledEvent(
@@ -83,6 +107,7 @@ def synthetic_events() -> list[tuple[BaseEvent, Priority]]:
                 description="Weekly memory consolidation timer fired",
                 fires_at=ago(hours=1),
                 note="Look over the week's memories, merge duplicates, prune anything stale.",
+                schedule="memory-consolidation",
             ),
             Priority.BACKGROUND,
         ),
@@ -93,6 +118,20 @@ def synthetic_events() -> list[tuple[BaseEvent, Priority]]:
                 job_id="backup-1183",
                 outcome="failed",
                 summary="rsync exited 23 after 4.2GB — permission denied on /workspace/old/.cache",
+                job="backup",
+            ),
+            Priority.LOW,
+        ),
+        (
+            # The same job failing the same way a day earlier. Two events on one
+            # stream saying the same thing is what the sweep exists to notice.
+            JobEvent(
+                timestamp=ago(days=1, hours=6),
+                description="Archive backup job failed",
+                job_id="backup-1182",
+                outcome="failed",
+                summary="rsync exited 23 after 4.2GB — permission denied on /workspace/old/.cache",
+                job="backup",
             ),
             Priority.LOW,
         ),
@@ -101,7 +140,8 @@ def synthetic_events() -> list[tuple[BaseEvent, Priority]]:
                 timestamp=ago(hours=5),
                 description="Mentioned in a busy group chat, no question directed at the character",
                 sender="quill",
-                channel="#general",
+                venue="discord",
+                conversation="#general",
                 body="ha, elara's been doing this for months, ask them about the gradient thing",
             ),
             Priority.LOW,
@@ -111,8 +151,10 @@ def synthetic_events() -> list[tuple[BaseEvent, Priority]]:
                 timestamp=ago(days=3),
                 description="Unanswered question from Ines, going stale",
                 sender="ines",
-                channel="dm",
+                venue="discord",
+                conversation="dm:ines",
                 body="do you still have the brush pack you were using in august? no rush",
+                direct=True,
             ),
             Priority.NORMAL,
         ),
@@ -121,8 +163,10 @@ def synthetic_events() -> list[tuple[BaseEvent, Priority]]:
                 timestamp=ago(days=2, hours=4),
                 description="Automated platform notification, no action implied",
                 sender="noreply@gallery.example",
-                channel="email",
+                venue="email",
+                conversation="monthly-stats",
                 body="Your monthly stats: 3 new followers, 412 views. View your dashboard.",
+                direct=True,
             ),
             Priority.BACKGROUND,
         ),

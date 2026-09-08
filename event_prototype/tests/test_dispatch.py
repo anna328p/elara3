@@ -2,24 +2,19 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
 from types import SimpleNamespace
 
 import pytest
 
 from event_prototype.agents import Agent, AgentRole
 from event_prototype.config import Config
-from event_prototype.events import MessageEvent, Priority
+from event_prototype.events import JobEvent, Priority, ScheduledEvent
 from event_prototype.queue import EventQueue
 from event_prototype.render import PromptRenderer
-from event_prototype.store import IN_MEMORY, LogAction, Status, utcnow
+from event_prototype.store import LogAction, Status, utcnow
 from event_prototype.tools import Dispatcher
 
-
-@pytest.fixture
-async def queue() -> AsyncIterator[EventQueue]:
-    async with await EventQueue.open(IN_MEMORY) as queue:
-        yield queue
+from conftest import message
 
 
 def dispatcher(queue: EventQueue, role: AgentRole = AgentRole.TRIAGE) -> Dispatcher:
@@ -30,16 +25,6 @@ def dispatcher(queue: EventQueue, role: AgentRole = AgentRole.TRIAGE) -> Dispatc
         config=Config(),
         renderer=PromptRenderer(),
         agent=Agent.spawn(role),
-    )
-
-
-def message(body: str = "hello") -> MessageEvent:
-    return MessageEvent(
-        timestamp=utcnow(),
-        description="a message",
-        sender="mira",
-        channel="#workshop",
-        body=body,
     )
 
 
@@ -132,6 +117,46 @@ async def test_a_failed_digest_leaves_the_previous_line_standing(
     row = await queue.get(event_id)
     assert row.digest is None
     assert row.status is Status.DEFERRED  # the disposition itself still stands
+
+
+async def test_an_assignment_records_the_streams_it_spanned(queue: EventQueue) -> None:
+    """A sequence crossing streams is the case streams cannot express on their own."""
+    job = await queue.submit(
+        JobEvent(
+            timestamp=utcnow(),
+            description="render finished",
+            job_id="render-1",
+            outcome="ok",
+            summary="done",
+            job="render",
+        ),
+        Priority.NORMAL,
+    )
+    question = await queue.submit(message(), Priority.REALTIME)
+    triage = dispatcher(queue)
+
+    # No client, so the subagent fails — the streams are recorded either way.
+    await triage.assign([job, question], "answer her", LogAction.HANDLE_EVENT_SEQUENCE)
+    await triage.drain()
+
+    (disposition,) = triage.dispositions
+    assert disposition.streams == ("render job", "#workshop")
+
+
+async def test_a_streamless_event_contributes_no_stream(queue: EventQueue) -> None:
+    alarm = await queue.submit(
+        ScheduledEvent(
+            timestamp=utcnow(), description="one-off", fires_at=utcnow(), note="once"
+        ),
+        Priority.LOW,
+    )
+    triage = dispatcher(queue)
+
+    await triage.assign([alarm], "do it", LogAction.HANDLE_ONE_EVENT)
+    await triage.drain()
+
+    (disposition,) = triage.dispositions
+    assert disposition.streams == ()
 
 
 async def test_separate_passes_may_revisit_the_same_event(queue: EventQueue) -> None:

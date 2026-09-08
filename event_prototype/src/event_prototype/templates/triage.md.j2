@@ -5,7 +5,7 @@ The current time is {{ now }}. There are {{ events | length }} events awaiting a
 decision, most urgent first.
 
 {% for event in events %}
-<event id="{{ event.id }}" kind="{{ event.kind }}" priority="{{ event.priority }}">
+<event id="{{ event.id }}" kind="{{ event.kind }}" priority="{{ event.priority }}"{% if event.stream %} stream="{{ event.stream }}"{% endif %}>
 Received {{ event.age }} ({{ event.timestamp }})
 {{ event.description }}
 
@@ -21,7 +21,7 @@ if one of them bears on an event above, you can pull it back in with
 
 <deferred>
 {% for event in deferred %}
-{{ event.id }}: [{{ event.priority }}] {{ event.summary }} ({{ event.age }})
+{{ event.id }}: [{{ event.priority }}]{% if event.stream %} ({{ event.stream }}){% endif %} {{ event.summary }} ({{ event.age }})
 {% endfor %}
 </deferred>
 
@@ -30,10 +30,10 @@ Assign every event above exactly one disposition, using these tools:
 
 - `handle_one_event` — the event needs work and stands on its own. A capable
   subagent will be given the event and your instructions.
-- `handle_event_sequence` — several events are one piece of work, or must be
-  handled in a specific order (a conversation thread, a job whose result changes
-  how an earlier request should be answered). One subagent takes them in the
-  order you list.
+- `handle_event_sequence` — handling one of these events changes how another
+  should be handled, so one subagent takes them in the order you list. The
+  clearest case crosses streams: a job whose result answers a question someone
+  asked somewhere else.
 - `defer_event` — the event does not need attention now. Say why; it goes to the
   deferred backlog, which is swept separately.
 
@@ -44,6 +44,11 @@ Guidance:
   become stale enough to matter, or they unblock something urgent.
 - Group only what genuinely belongs together. Two unrelated messages from the
   same person are still two events.
+- A `stream` is where an event happened — a room, a correspondent, a recurring
+  job — not what it is about. Two events sharing a stream are a reason to look
+  for a connection, not evidence of one; two consecutive messages from the same
+  person are usually one piece of work, two unrelated pings in a busy room are
+  not.
 - Deferring is not dismissal and not a verdict on whether the event matters at
   all — that call belongs to the sweep, which sees the full history. Defer when
   the event does not need attention in this pass.

@@ -7,7 +7,7 @@ The current time is {{ now }}. There are {{ events | length }} deferred events,
 most urgent first. Each carries the log of what has been decided about it.
 
 {% for event in events %}
-<event id="{{ event.id }}" kind="{{ event.kind }}" priority="{{ event.priority }}">
+<event id="{{ event.id }}" kind="{{ event.kind }}" priority="{{ event.priority }}"{% if event.stream %} stream="{{ event.stream }}"{% endif %}>
 Received {{ event.age }} ({{ event.timestamp }})
 {{ event.description }}
 

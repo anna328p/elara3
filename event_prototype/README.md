@@ -11,8 +11,9 @@ nix develop          # python 3.12 + uv + sqlite
 uv sync --extra dev
 uv run pytest
 
-uv run python -m event_prototype seed --fresh   # ten synthetic events
+uv run python -m event_prototype seed --fresh   # a dozen synthetic events
 uv run python -m event_prototype list
+uv run python -m event_prototype streams        # the ongoing contexts they belong to
 uv run python -m event_prototype triage --dry-run   # the prompt, no API call
 uv run python -m event_prototype triage             # the real thing
 uv run python -m event_prototype sweep              # reconsider the backlog
@@ -59,6 +60,36 @@ has the dispositions that triage should not be making in a hurry:
 **Archived** is nobody's. The event drops out of both passes and survives in the
 log and `list --all`.
 
+## Streams
+
+A stream is a durable locus of activity: a room, a correspondent, a recurring
+job. Events derive their own — `MessageEvent` from its venue and conversation,
+`JobEvent` and `ScheduledEvent` from the series a run belongs to — so every
+message in a room necessarily lands on the same stream rather than being sorted
+onto one. Belonging is optional: a one-off alarm or a single job run says so by
+naming no stream at all.
+
+Venue and stream are orthogonal. The venue is the medium — Discord, email — and
+nothing is ever "the email stream"; it only qualifies a conversation's id, so
+that `#general` on two platforms stays two streams. What a two-party exchange
+needs beyond that is `direct`, because an id alone cannot say whether a place is
+a room or a relationship, and the two are not the same kind of thing.
+
+The prompts show the stream as an attribute on each event, which sharpens
+`handle_event_sequence` rather than replacing it. A stream is where an event
+happened, not what it is about, so sharing one is a reason to look for a
+connection and not evidence of one — and the clearest reason to group events
+runs the other way, across streams, as when a job's result answers a question
+someone asked somewhere else. That case is why the tool keeps its shape, and it
+is where persistent contexts will land: once a subagent is a stream's long-lived
+cached context, a same-stream sequence means handing work to that context and a
+cross-stream one means a message between two. The pass report prints the streams
+each assignment spanned, so a crossing is visible when it happens.
+
+Streams capture the locus, not the topic. A `#general` mention and a later DM
+from the same person are different streams, so it is still the digest line that
+links them; the two signals are orthogonal and both are needed.
+
 The handling tools *schedule* rather than execute: each call mints a subagent,
 records the assignment, spawns an asyncio task and returns immediately, so
 subagents run in parallel while the pass keeps working. A pass ends when every
@@ -77,7 +108,8 @@ protocol as a remote server, minus the subprocess.
 | --- | --- |
 | `events.py` | the `Event` protocol, `Priority`, and the concrete kinds |
 | `agents.py` | agent identity: a role and a UUID, minted when an agent starts |
-| `store.py` | the two SQLAlchemy rows and engine setup |
+| `streams.py` | stream identity: the kind of context, its key and its label |
+| `store.py` | the three SQLAlchemy rows and engine setup |
 | `queue.py` | `EventQueue`: submit, edit, the dispositions, and the two views |
 | `render.py` + `templates/` | rows → prompts |
 | `tools.py` | the two tool sets and the dispatcher they act on |
@@ -98,10 +130,18 @@ subagent the work went to, so a dispatch and the report that follows it can be
 tied together. State changes and their log rows are written in the same
 transaction, so status and reasoning can never disagree.
 
+`streams` holds identity only. It caches neither a last-activity stamp nor an
+event count: both are aggregates over `events`, and the listing needs a GROUP BY
+anyway, so a cached copy would be one more thing that can be wrong — and would
+be, since events do not arrive in the order they happened.
+
 Reads are indexed on `(event_id, timestamp)` and never go per-event. Triage is a
 single query, since the digest needs no history at all; the sweep is two, one for
 the events and one for the whole slice of log they point at, however large the
-backlog.
+backlog. An event's stream rides along in those same statements — the join is
+declared on the relationship rather than requested at each call site, so it
+cannot be forgotten on a path that later renders a prompt, and the counts above
+are the ones the tests assert.
 
 Events are never deleted. Archiving stamps `archived_at` and drops the event from
 both passes, but `list --all` still shows it, log and all.

@@ -23,7 +23,7 @@ from .digest import summarize
 from .events import Priority
 from .queue import EventQueue
 from .render import PromptRenderer
-from .store import LogAction
+from .store import EventRow, LogAction
 from .subagent import run_subagent
 
 #: How the models name a priority level, since the stored value is an integer.
@@ -44,6 +44,10 @@ class Disposition:
     agent: Agent | None = None
     report: str | None = None
     error: str | None = None
+    #: The streams these events came from, in order and deduplicated. More than
+    #: one means the assignment crossed streams — the case that will become a
+    #: message between persistent contexts rather than one subagent reading both.
+    streams: tuple[str, ...] = ()
 
 
 class Dispatcher:
@@ -162,8 +166,10 @@ class Dispatcher:
     ) -> None:
         """Run one subagent over `event_ids` and record what came back."""
         ids = list(event_ids)
+        streams: tuple[str, ...] = ()
         try:
             rows = await self.queue.get_many(ids)
+            streams = _streams_of(rows)
             report = await run_subagent(
                 self.client, self.config, self.renderer, rows, instructions
             )
@@ -172,12 +178,21 @@ class Dispatcher:
             error = f"{type(exc).__name__}: {exc}"
             await self.queue.record_failure(ids, agent=subagent, error=error)
             self.dispositions.append(
-                Disposition(action, ids, instructions, agent=subagent, error=error)
+                Disposition(
+                    action, ids, instructions, agent=subagent, error=error, streams=streams
+                )
             )
             return
         self.dispositions.append(
-            Disposition(action, ids, instructions, agent=subagent, report=report)
+            Disposition(
+                action, ids, instructions, agent=subagent, report=report, streams=streams
+            )
         )
+
+def _streams_of(rows: Sequence[EventRow]) -> tuple[str, ...]:
+    """The streams these events came from, first seen first, without repeats."""
+    titles = (row.stream.title for row in rows if row.stream is not None)
+    return tuple(dict.fromkeys(titles))
 
 
 def build_triage_server(dispatcher: Dispatcher) -> MCPServer:

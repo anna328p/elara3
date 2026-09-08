@@ -16,7 +16,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Self
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from .agents import Agent
@@ -26,8 +26,10 @@ from .store import (
     EventRow,
     LogAction,
     Status,
+    StreamRow,
     create_engine,
     init_schema,
+    resolve_stream,
     session_factory,
     utcnow,
 )
@@ -59,6 +61,15 @@ class SweepView:
     history: History
 
 
+@dataclass(frozen=True, slots=True)
+class StreamSummary:
+    """A stream and how much is going on in it."""
+
+    stream: StreamRow
+    active: int
+    last_event_at: datetime | None
+
+
 class EventQueue:
     def __init__(self, engine: AsyncEngine, sessions: async_sessionmaker[AsyncSession]) -> None:
         self._engine = engine
@@ -85,16 +96,27 @@ class EventQueue:
         await self.aclose()
 
     async def submit(self, event: Event, priority: Priority = Priority.NORMAL) -> int:
-        """Queue an event; returns the id used to refer to it from here on."""
-        row = EventRow(
-            kind=type(event).kind,
-            timestamp=event.timestamp,
-            description=event.description,
-            payload=event.payload(),
-            priority=priority,
-            status=Status.PENDING,
-        )
+        """Queue an event; returns the id used to refer to it from here on.
+
+        If the event names a stream, it is opened on first sight and joined
+        thereafter, in the same transaction as the event itself — so an event
+        can never end up pointing at a stream that was rolled back.
+
+        The id is returned rather than the row on purpose: a row that was just
+        added has no loaded `stream`, and reaching for one after the session
+        closes raises. Callers that want the stream go through `get`.
+        """
         async with self._sessions.begin() as session:
+            ref = event.stream
+            row = EventRow(
+                kind=type(event).kind,
+                timestamp=event.timestamp,
+                description=event.description,
+                payload=event.payload(),
+                priority=priority,
+                status=Status.PENDING,
+                stream_id=await resolve_stream(session, ref) if ref else None,
+            )
             session.add(row)
         return row.id
 
@@ -261,6 +283,26 @@ class EventQueue:
             query = self._events_query().where(EventRow.status == Status.DEFERRED)
             rows = list((await session.scalars(query)).all())
             return SweepView(rows, await self._history(session, [r.id for r in rows]))
+
+    async def list_streams(self) -> list[StreamSummary]:
+        """Every stream with its active event count and last activity, busiest first.
+
+        One query, and the aggregate is why `streams` caches neither number:
+        both fall out of the same GROUP BY that has to happen anyway.
+        """
+        active = func.count(EventRow.id).filter(
+            EventRow.archived_at.is_(None), EventRow.status != Status.COMPLETED
+        )
+        last_event_at = func.max(EventRow.timestamp)
+        query = (
+            select(StreamRow, active, last_event_at)
+            .outerjoin(EventRow, EventRow.stream_id == StreamRow.id)
+            .group_by(StreamRow.id)
+            .order_by(last_event_at.desc())
+        )
+        async with self._sessions() as session:
+            rows = (await session.execute(query)).all()
+        return [StreamSummary(stream, count, last) for stream, count, last in rows]
 
     async def history_for(self, event_ids: Sequence[int]) -> History:
         """Log entries for these events, oldest first. One query."""

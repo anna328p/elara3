@@ -50,6 +50,9 @@ class EventView:
     #: The line that stands in for this event where it is listed rather than
     #: shown, falling back to the description until one has been written.
     summary: str
+    #: The ongoing context this event belongs to, as a prompt reads it. `None`
+    #: for events that belong to nothing ongoing.
+    stream: str | None = None
     history: tuple[LogView, ...] = ()
 
     @classmethod
@@ -66,6 +69,7 @@ class EventView:
             description=row.description,
             payload=json.dumps(row.payload, indent=2, sort_keys=True, ensure_ascii=False),
             summary=row.digest or row.description,
+            stream=row.stream.title if row.stream else None,
             history=tuple(LogView.of(entry) for entry in history),
         )
 

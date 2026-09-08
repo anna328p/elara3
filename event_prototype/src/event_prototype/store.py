@@ -1,9 +1,10 @@
 """SQLite persistence for the event queue.
 
-Two tables: `events` is current state, `event_log` is the append-only record of
-what was decided about each one and by whom. Rows are never deleted — archiving
-stamps `archived_at` and every default query filters those out, so the audit
-trail stays intact.
+Three tables: `events` is current state, `event_log` is the append-only record of
+what was decided about each one and by whom, and `streams` is the ongoing
+contexts events belong to. Rows are never deleted — archiving stamps
+`archived_at` and every default query filters those out, so the audit trail
+stays intact.
 """
 
 from __future__ import annotations
@@ -13,14 +14,25 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, ForeignKey, Index, Integer, String, TypeDecorator
+from sqlalchemy import (
+    JSON,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    TypeDecorator,
+    UniqueConstraint,
+)
 from sqlalchemy import Enum as SAEnum
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.pool import StaticPool
 
 from .agents import Agent, AgentRole
 from .events import BaseEvent, Priority, from_payload
+from .streams import StreamKind, StreamRef
 
 IN_MEMORY = ":memory:"
 
@@ -89,6 +101,34 @@ class Base(DeclarativeBase):
     type_annotation_map = {datetime: UTCDateTime}
 
 
+class StreamRow(Base):
+    """An ongoing context events belong to: a room, a correspondent, a job.
+
+    Identity is `(kind, key)`; the surrogate id is what `events.stream_id`
+    points at. There is deliberately no cached "last event" column — that is
+    `max(events.timestamp)`, and a cached copy would only be another thing to
+    keep true. This is also where a persistent subagent context will attach.
+    """
+
+    __tablename__ = "streams"
+    __table_args__ = (UniqueConstraint("kind", "key", name="uq_streams_kind_key"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+
+    kind: Mapped[StreamKind] = mapped_column(
+        SAEnum(StreamKind, native_enum=False, length=16)
+    )
+    key: Mapped[str] = mapped_column(String(255))
+    title: Mapped[str]
+
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+    #: Touched every time an event joins, so this doubles as "last seen".
+    updated_at: Mapped[datetime] = mapped_column(default=utcnow, onupdate=utcnow)
+
+    def __repr__(self) -> str:
+        return f"StreamRow(id={self.id}, kind={self.kind.value}, key={self.key!r})"
+
+
 class EventRow(Base):
     __tablename__ = "events"
 
@@ -98,6 +138,15 @@ class EventRow(Base):
     timestamp: Mapped[datetime]
     description: Mapped[str]
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+    stream_id: Mapped[int | None] = mapped_column(
+        ForeignKey("streams.id"), index=True, default=None
+    )
+    #: Eager by join rather than by choice at each call site. Rows outlive the
+    #: session that produced them (`expire_on_commit=False`), so a lazy load
+    #: would raise wherever a prompt is rendered; and being many-to-one, this
+    #: rides along in the same SELECT, leaving every query count unchanged.
+    stream: Mapped[StreamRow | None] = relationship(lazy="joined")
 
     priority: Mapped[Priority] = mapped_column(PriorityType)
     status: Mapped[Status] = mapped_column(
@@ -167,6 +216,28 @@ class EventLogRow(Base):
             f"EventLogRow(event_id={self.event_id}, action={self.action.value}, "
             f"agent={self.agent.label!r})"
         )
+
+
+async def resolve_stream(session: AsyncSession, ref: StreamRef) -> int:
+    """The id of the stream `ref` names, opening it if this is its first event.
+
+    One statement: SQLite's upsert either inserts or returns the row already
+    there, so two events racing to open the same stream cannot produce two of
+    it. The assignment on conflict looks redundant but is not — `DO NOTHING`
+    yields no `RETURNING` row, which would cost a second query to recover.
+    """
+    stmt = (
+        sqlite_insert(StreamRow)
+        .values(kind=ref.kind, key=ref.key, title=ref.title)
+        .on_conflict_do_update(
+            index_elements=["kind", "key"], set_={"updated_at": utcnow()}
+        )
+        .returning(StreamRow.id)
+    )
+    stream_id = await session.scalar(stmt)
+    if stream_id is None:  # RETURNING on an upsert always yields exactly one row
+        raise RuntimeError(f"stream upsert returned nothing for {ref.key!r}")
+    return stream_id
 
 
 def create_engine(db_path: Path | str) -> AsyncEngine:
