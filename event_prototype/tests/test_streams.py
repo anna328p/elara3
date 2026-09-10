@@ -13,8 +13,6 @@ from event_prototype.streams import StreamKind
 
 from conftest import counting_selects, message
 
-TRIAGE = Agent.spawn(AgentRole.TRIAGE)
-
 
 # -- derivation, no database needed ---------------------------------------
 
@@ -149,7 +147,7 @@ async def test_a_completed_event_leaves_the_stream_but_not_the_count(
 ) -> None:
     first = await queue.submit(message(sender="mira", conversation="#workshop"), Priority.NORMAL)
     await queue.submit(message(sender="hal", conversation="#workshop"), Priority.LOW)
-    await queue.complete([first], agent=Agent.spawn(AgentRole.SUBAGENT), report="done")
+    await queue.complete([first], agent=await queue.spawn(AgentRole.SUBAGENT), report="done")
 
     (summary,) = await queue.list_streams()
     assert summary.active == 1  # the stream itself stays
@@ -159,7 +157,7 @@ async def test_a_completed_event_leaves_the_stream_but_not_the_count(
 
 
 async def test_the_stream_rides_along_and_survives_the_session(
-    queue: EventQueue,
+    queue: EventQueue, triage: Agent
 ) -> None:
     """The regression this guards is a raise, not a wrong answer.
 
@@ -169,12 +167,12 @@ async def test_the_stream_rides_along_and_survives_the_session(
     """
     await queue.submit(message(sender="mira", conversation="#workshop"), Priority.HIGH)
     deferred = await queue.submit(message(sender="hal", conversation="#workshop"), Priority.LOW)
-    await queue.defer([(deferred, "later")], agent=TRIAGE)
+    await queue.defer([(deferred, "later")], agent=triage)
 
     with counting_selects() as selects:
-        triage = await queue.triage_view()
+        view = await queue.triage_view()
     assert len(selects) == 1, selects
-    assert triage.pending[0].stream is not None  # outside the session, does not raise
+    assert view.pending[0].stream is not None  # outside the session, does not raise
 
     with counting_selects() as selects:
         sweep = await queue.sweep_view()
@@ -202,11 +200,11 @@ async def test_listing_every_stream_is_one_query(queue: EventQueue) -> None:
 
 
 async def test_the_stream_reaches_the_prompt_and_the_backlog_line(
-    queue: EventQueue,
+    queue: EventQueue, triage: Agent
 ) -> None:
     pending = await queue.submit(message(sender="mira", conversation="#workshop"), Priority.HIGH)
     deferred = await queue.submit(message(sender="quill", conversation="#general"), Priority.LOW)
-    await queue.defer([(deferred, "no question in it")], agent=TRIAGE)
+    await queue.defer([(deferred, "no question in it")], agent=triage)
 
     view = await queue.triage_view()
     prompt = PromptRenderer().triage(view.pending, view.deferred)

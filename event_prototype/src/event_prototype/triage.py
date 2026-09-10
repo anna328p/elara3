@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from anthropic import AsyncAnthropic
 
-from .agents import Agent, AgentRole
+from .agents import AgentRole
 from .config import Config
 from .queue import EventQueue
 from .render import PromptRenderer
@@ -26,7 +26,7 @@ async def run_triage(
 ) -> PassResult:
     """Triage every pending event, then wait for the subagents it spawned."""
     renderer = renderer or PromptRenderer()
-    agent = Agent.spawn(AgentRole.TRIAGE)
+    agent = await queue.spawn(AgentRole.TRIAGE)
 
     view = await queue.triage_view()
     if not view.pending:

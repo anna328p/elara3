@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from event_prototype.agents import Agent, AgentRole
+from event_prototype.agents import AgentRole
 from event_prototype.config import Config
 from event_prototype.events import JobEvent, Priority, ScheduledEvent
 from event_prototype.queue import EventQueue
@@ -17,20 +17,20 @@ from event_prototype.tools import Dispatcher
 from conftest import FakeMessages, message
 
 
-def dispatcher(queue: EventQueue, role: AgentRole = AgentRole.TRIAGE) -> Dispatcher:
+async def dispatcher(queue: EventQueue, role: AgentRole = AgentRole.TRIAGE) -> Dispatcher:
     # No client: these tests never reach the point of running a subagent.
     return Dispatcher(
         queue,
         client=None,  # type: ignore[arg-type]
         config=Config(),
         renderer=PromptRenderer(),
-        agent=Agent.spawn(role),
+        agent=await queue.spawn(role),
     )
 
 
 async def test_an_event_gets_only_one_disposition_per_pass(queue: EventQueue) -> None:
     event_id = await queue.submit(message(), Priority.NORMAL)
-    triage = dispatcher(queue)
+    triage = await dispatcher(queue)
 
     await triage.defer(event_id, "not now")
 
@@ -48,7 +48,7 @@ async def test_a_rejected_disposition_leaves_the_batch_untouched(
 ) -> None:
     first = await queue.submit(message("one"), Priority.NORMAL)
     second = await queue.submit(message("two"), Priority.NORMAL)
-    triage = dispatcher(queue)
+    triage = await dispatcher(queue)
 
     await triage.defer(first, "not now")
 
@@ -64,7 +64,7 @@ async def test_a_rejected_disposition_leaves_the_batch_untouched(
 async def test_setting_an_event_aside_writes_its_backlog_line(queue: EventQueue) -> None:
     event_id = await queue.submit(message(), Priority.LOW)
     messages = FakeMessages("  mira asked about\n  the gradient banding  ")
-    triage = dispatcher(queue)
+    triage = await dispatcher(queue)
     triage.client = SimpleNamespace(messages=messages)  # type: ignore[assignment]
 
     await triage.defer(event_id, "not now")
@@ -80,10 +80,10 @@ async def test_keeping_an_event_deferred_rewrites_its_backlog_line(
     queue: EventQueue,
 ) -> None:
     event_id = await queue.submit(message(), Priority.LOW)
-    await queue.defer([(event_id, "not now")], agent=Agent.spawn(AgentRole.TRIAGE))
+    await queue.defer([(event_id, "not now")], agent=await queue.spawn(AgentRole.TRIAGE))
     await queue.set_digest(event_id, "the line triage has been reading")
 
-    sweeper = dispatcher(queue, AgentRole.SWEEP)
+    sweeper = await dispatcher(queue, AgentRole.SWEEP)
     sweeper.client = SimpleNamespace(messages=FakeMessages("still waiting on quill"))  # type: ignore[assignment]
     await sweeper.keep_deferred(event_id, "no follow-up yet")
     await sweeper.drain()
@@ -95,7 +95,7 @@ async def test_a_failed_digest_leaves_the_previous_line_standing(
     queue: EventQueue,
 ) -> None:
     event_id = await queue.submit(message(), Priority.LOW)
-    triage = dispatcher(queue)  # client is None, so summarizing raises
+    triage = await dispatcher(queue)  # client is None, so summarizing raises
 
     await triage.defer(event_id, "not now")
     await triage.drain()  # must not propagate
@@ -119,7 +119,7 @@ async def test_an_assignment_records_the_streams_it_spanned(queue: EventQueue) -
         Priority.NORMAL,
     )
     question = await queue.submit(message(), Priority.REALTIME)
-    triage = dispatcher(queue)
+    triage = await dispatcher(queue)
 
     # No client, so the subagent fails — the streams are recorded either way.
     await triage.assign([job, question], "answer her", LogAction.HANDLE_EVENT_SEQUENCE)
@@ -136,7 +136,7 @@ async def test_a_streamless_event_contributes_no_stream(queue: EventQueue) -> No
         ),
         Priority.LOW,
     )
-    triage = dispatcher(queue)
+    triage = await dispatcher(queue)
 
     await triage.assign([alarm], "do it", LogAction.HANDLE_ONE_EVENT)
     await triage.drain()
@@ -148,9 +148,11 @@ async def test_a_streamless_event_contributes_no_stream(queue: EventQueue) -> No
 async def test_separate_passes_may_revisit_the_same_event(queue: EventQueue) -> None:
     event_id = await queue.submit(message(), Priority.LOW)
 
-    await dispatcher(queue).defer(event_id, "not now")
+    triage = await dispatcher(queue)
+    await triage.defer(event_id, "not now")
     # The claim is per pass, so a later sweep can still act on it.
-    await dispatcher(queue, AgentRole.SWEEP).archive(event_id, "never actionable")
+    sweeper = await dispatcher(queue, AgentRole.SWEEP)
+    await sweeper.archive(event_id, "never actionable")
 
     # Archived events are no longer addressable, so look in the full listing.
     (row,) = await queue.list_events(active_only=False)

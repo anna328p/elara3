@@ -109,7 +109,7 @@ class Dispatcher:
         self._claim(event_ids, action)
         rows = await self.queue.get_many(event_ids)
         context = await self._context_of(rows)
-        subagent = context.agent if context else Agent.spawn(AgentRole.SUBAGENT)
+        subagent = context.agent if context else await self.queue.spawn(AgentRole.SUBAGENT)
         await self.queue.assign(
             event_ids,
             agent=self.agent,

@@ -13,6 +13,7 @@ from anthropic.types import Message, TextBlock, Usage
 from sqlalchemy import event as sa_event
 from sqlalchemy.engine import Engine
 
+from event_prototype.agents import Agent, AgentRole
 from event_prototype.events import MessageEvent
 from event_prototype.queue import EventQueue
 from event_prototype.store import IN_MEMORY, utcnow
@@ -22,6 +23,12 @@ from event_prototype.store import IN_MEMORY, utcnow
 async def queue() -> AsyncIterator[EventQueue]:
     async with await EventQueue.open(IN_MEMORY) as queue:
         yield queue
+
+
+@pytest.fixture
+async def triage(queue: EventQueue) -> Agent:
+    """A triage agent the queue knows about, for tests that act as one."""
+    return await queue.spawn(AgentRole.TRIAGE)
 
 
 def message(

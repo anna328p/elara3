@@ -1,11 +1,11 @@
 """SQLite persistence for the event queue.
 
 `events` is current state and `event_log` the append-only record of what was
-decided about each one and by whom. `streams` is the ongoing loci events belong
-to, each routed to at most one `contexts` row: the conversation an agent is
-having there, stored as `turns`. Rows are never deleted — archiving stamps
-`archived_at` and every default query filters those out, so the audit trail
-stays intact.
+decided about each one and by whom — "whom" being a row in `agents`, which every
+attribution points at. `streams` is the ongoing loci events belong to, each
+routed to at most one `contexts` row: the conversation an agent is having there,
+stored as `turns`. Rows are never deleted — archiving stamps `archived_at` and
+every default query filters those out, so the audit trail stays intact.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from sqlalchemy import (
     JSON,
@@ -24,12 +25,14 @@ from sqlalchemy import (
     String,
     TypeDecorator,
     UniqueConstraint,
+    event,
 )
 from sqlalchemy import Enum as SAEnum
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.engine.interfaces import DBAPIConnection
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import ConnectionPoolEntry, StaticPool
 
 from .agents import Agent, AgentRole
 from .contexts import Block, Role, Turn
@@ -140,6 +143,32 @@ class StreamRow(Base):
         return f"StreamRow(id={self.id}, kind={self.kind.value}, key={self.key!r})"
 
 
+class AgentRow(Base):
+    """An agent: the thing log entries are attributed to and contexts belong to.
+
+    Nothing more than an identity and a role for now. In the real framework
+    this row grows an event loop, a name, a budget; here it exists so that
+    every attribution is a foreign key to something, and the role is written
+    once rather than alongside each reference.
+    """
+
+    __tablename__ = "agents"
+
+    #: A UUID rather than a serial: agents are minted from many places at once
+    #: and referred to across processes, so the id should not depend on order.
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    role: Mapped[AgentRole] = mapped_column(
+        SAEnum(AgentRole, native_enum=False, length=16)
+    )
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+    def to_agent(self) -> Agent:
+        return Agent(self.role, self.id)
+
+    def __repr__(self) -> str:
+        return f"AgentRow({self.to_agent().label!r})"
+
+
 class ContextRow(Base):
     """A conversation an agent is having, replayable as one Messages API call."""
 
@@ -150,10 +179,10 @@ class ContextRow(Base):
     #: Whose conversation this is. Minted when the context opens and kept, so
     #: returning work in a stream reaches the same subagent — the identity in
     #: the event log and the memory in the transcript are the same thing.
-    agent_id: Mapped[str] = mapped_column(String(36))
-    agent_role: Mapped[AgentRole] = mapped_column(
-        SAEnum(AgentRole, native_enum=False, length=16)
-    )
+    agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id"))
+    #: Joined, for the same reason as `EventRow.stream`: rows outlive their
+    #: session, and many-to-one costs nothing extra in the same SELECT.
+    actor: Mapped[AgentRow] = relationship(lazy="joined")
 
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
     #: Touched whenever a turn is appended.
@@ -161,7 +190,7 @@ class ContextRow(Base):
 
     @property
     def agent(self) -> Agent:
-        return Agent(self.agent_role, self.agent_id)
+        return self.actor.to_agent()
 
     def __repr__(self) -> str:
         return f"ContextRow(id={self.id}, agent={self.agent.label!r})"
@@ -275,18 +304,27 @@ class EventLogRow(Base):
     #: The triage model's reason or instructions, or the subagent's report.
     detail: Mapped[str]
 
-    # The role rides along with the id: there is no agents table yet, and the
-    # log has to be readable on its own.
-    agent_id: Mapped[str] = mapped_column(String(36))
-    agent_role: Mapped[AgentRole] = mapped_column(
-        SAEnum(AgentRole, native_enum=False, length=16)
-    )
+    #: Who did it.
+    agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id"))
     #: On an assignment, the subagent the work went to.
-    assigned_agent_id: Mapped[str | None] = mapped_column(String(36), default=None)
+    assigned_agent_id: Mapped[str | None] = mapped_column(
+        ForeignKey("agents.id"), default=None
+    )
+    # Both joined: the log is read to be rendered, after its session is gone,
+    # and the role that `label` needs lives on the agent row now. Two foreign
+    # keys into one table, so each relationship has to say which is its own.
+    actor: Mapped[AgentRow] = relationship(lazy="joined", foreign_keys=[agent_id])
+    assignee: Mapped[AgentRow | None] = relationship(
+        lazy="joined", foreign_keys=[assigned_agent_id]
+    )
 
     @property
     def agent(self) -> Agent:
-        return Agent(self.agent_role, self.agent_id)
+        return self.actor.to_agent()
+
+    @property
+    def assigned(self) -> Agent | None:
+        return self.assignee.to_agent() if self.assignee else None
 
     def __repr__(self) -> str:
         return (
@@ -321,6 +359,19 @@ class StreamNotFound(KeyError):
     """No stream with that id."""
 
 
+async def spawn_agent(session: AsyncSession, role: AgentRole) -> AgentRow:
+    """Mint an agent: a new row, in the caller's transaction.
+
+    This is the only way an agent comes into being, so nothing can be
+    attributed to one the store has never heard of — the foreign keys on
+    `event_log` and `contexts` see to the rest.
+    """
+    row = AgentRow(role=role)
+    session.add(row)
+    await session.flush()  # so the id is settled before anything points at it
+    return row
+
+
 async def resolve_context(session: AsyncSession, stream_id: int) -> ContextRow:
     """The context `stream_id` routes to, opened on first need.
 
@@ -339,25 +390,38 @@ async def resolve_context(session: AsyncSession, stream_id: int) -> ContextRow:
             raise RuntimeError(f"stream {stream_id} routes to a missing context")
         return context
 
-    agent = Agent.spawn(AgentRole.SUBAGENT)
-    context = ContextRow(agent_id=agent.id, agent_role=agent.role)
+    # Attached as the row rather than by id, so `context.agent` is answerable
+    # right away instead of needing a load the async session would refuse.
+    context = ContextRow(actor=await spawn_agent(session, AgentRole.SUBAGENT))
     session.add(context)
     await session.flush()  # for its id
     stream.context_id = context.id
     return context
 
 
+def _enforce_foreign_keys(
+    dbapi_connection: DBAPIConnection, connection_record: ConnectionPoolEntry
+) -> None:
+    """SQLite declares foreign keys but ignores them unless told, per connection."""
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.close()
+
+
 def create_engine(db_path: Path | str) -> AsyncEngine:
     """An async engine for `db_path`, or a shared in-memory database for tests."""
     if str(db_path) == IN_MEMORY:
-        return create_async_engine(
+        engine = create_async_engine(
             f"sqlite+aiosqlite:///{IN_MEMORY}",
             # One connection for the whole engine, so the schema survives between
             # sessions instead of each connection getting its own empty database.
             poolclass=StaticPool,
             connect_args={"check_same_thread": False},
         )
-    return create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+    else:
+        engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+    event.listen(engine.sync_engine, "connect", _enforce_foreign_keys)
+    return engine
 
 
 def session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:

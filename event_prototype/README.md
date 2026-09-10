@@ -151,10 +151,10 @@ for no caching, since nothing will read it back.
 | module | what it holds |
 | --- | --- |
 | `events.py` | the `Event` protocol, `Priority`, and the concrete kinds |
-| `agents.py` | agent identity: a role and a UUID, minted when an agent starts |
+| `agents.py` | agent identity: the role and UUID of a row the store mints when an agent starts |
 | `streams.py` | stream identity: the kind of locus, its key and its label |
 | `contexts.py` | a turn, and the transform from a transcript to an API message list |
-| `store.py` | the five SQLAlchemy rows, the two resolvers, and engine setup |
+| `store.py` | the six SQLAlchemy rows, the resolvers and the spawner, and engine setup |
 | `queue.py` | `EventQueue`: submit, edit, the dispositions, and the two views |
 | `render.py` + `templates/` | rows → prompts |
 | `tools.py` | the two tool sets and the dispatcher they act on |
@@ -174,6 +174,11 @@ instructions, and the agent it is attributed to. Assignments also name the
 subagent the work went to, so a dispatch and the report that follows it can be
 tied together. State changes and their log rows are written in the same
 transaction, so status and reasoning can never disagree.
+
+`agents` is what those attributions point at: one row per agent, holding its
+role, minted by the store when the agent starts work. The log and `contexts`
+reference it by foreign key, and SQLite is told to enforce them, so nothing can
+be attributed to an agent that was never minted and the role is written once.
 
 `streams` holds identity and routing: which context, if any, work in the stream
 goes to. It caches neither a last-activity stamp nor an event count: both are

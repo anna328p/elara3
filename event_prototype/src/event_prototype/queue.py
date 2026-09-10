@@ -19,7 +19,7 @@ from typing import Self
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from .agents import Agent
+from .agents import Agent, AgentRole
 from .contexts import Turn
 from .events import Event, Priority
 from .store import (
@@ -36,6 +36,7 @@ from .store import (
     resolve_context,
     resolve_stream,
     session_factory,
+    spawn_agent,
     utcnow,
 )
 
@@ -101,6 +102,11 @@ class EventQueue:
         tb: TracebackType | None,
     ) -> None:
         await self.aclose()
+
+    async def spawn(self, role: AgentRole) -> Agent:
+        """Mint an agent. Everything attributed to one starts here."""
+        async with self._sessions.begin() as session:
+            return (await spawn_agent(session, role)).to_agent()
 
     async def submit(self, event: Event, priority: Priority = Priority.NORMAL) -> int:
         """Queue an event; returns the id used to refer to it from here on.
@@ -390,7 +396,6 @@ class EventQueue:
                 action=action,
                 detail=detail,
                 agent_id=agent.id,
-                agent_role=agent.role,
                 assigned_agent_id=assigned.id if assigned else None,
             )
             for event_id, detail in entries

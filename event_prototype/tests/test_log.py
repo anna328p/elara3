@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from uuid import uuid4
+
+import pytest
+from sqlalchemy.exc import IntegrityError
+
 from event_prototype.agents import Agent, AgentRole
 from event_prototype.events import Priority
 from event_prototype.queue import EventQueue
@@ -10,17 +15,17 @@ from event_prototype.store import LogAction, Status
 
 from conftest import counting_selects, message
 
-TRIAGE = Agent.spawn(AgentRole.TRIAGE)
 
-
-async def test_an_events_history_reads_as_a_sequence(queue: EventQueue) -> None:
+async def test_an_events_history_reads_as_a_sequence(
+    queue: EventQueue, triage: Agent
+) -> None:
     event_id = await queue.submit(message(), Priority.NORMAL)
-    subagent = Agent.spawn(AgentRole.SUBAGENT)
+    subagent = await queue.spawn(AgentRole.SUBAGENT)
 
-    await queue.defer([(event_id, "no rush")], agent=TRIAGE)
+    await queue.defer([(event_id, "no rush")], agent=triage)
     await queue.assign(
         [event_id],
-        agent=TRIAGE,
+        agent=triage,
         subagent=subagent,
         instructions="answer her",
         action=LogAction.HANDLE_ONE_EVENT,
@@ -35,18 +40,60 @@ async def test_an_events_history_reads_as_a_sequence(queue: EventQueue) -> None:
         LogAction.REPORT,
     ]
     # The assignment names both ends: who decided, and who got the work.
-    assert entries[1].agent == TRIAGE
+    assert entries[1].agent == triage
     assert entries[1].assigned_agent_id == subagent.id
     assert entries[2].agent == subagent
 
 
-async def test_a_sequence_assignment_shares_one_subagent(queue: EventQueue) -> None:
+async def test_the_agents_on_an_entry_come_with_the_entry(
+    queue: EventQueue, triage: Agent
+) -> None:
+    """Roles live on the agent row now, and reading them costs no extra query."""
+    event_id = await queue.submit(message(), Priority.NORMAL)
+    subagent = await queue.spawn(AgentRole.SUBAGENT)
+    await queue.assign(
+        [event_id],
+        agent=triage,
+        subagent=subagent,
+        instructions="answer her",
+        action=LogAction.HANDLE_ONE_EVENT,
+    )
+
+    with counting_selects() as selects:
+        (entry,) = (await queue.history_for([event_id]))[event_id]
+
+    assert len(selects) == 1, selects  # both agents joined in, not fetched after
+    assert entry.agent.role is AgentRole.TRIAGE
+    assert entry.assigned is not None
+    assert entry.assigned == subagent
+    assert entry.assigned.role is AgentRole.SUBAGENT
+    assert triage.label in repr(entry)  # outside the session, still answerable
+
+
+async def test_nothing_is_attributed_to_an_agent_the_store_never_minted(
+    queue: EventQueue,
+) -> None:
+    """An `Agent` made by hand is not an agent: the foreign key refuses it."""
+    event_id = await queue.submit(message(), Priority.NORMAL)
+    stranger = Agent(AgentRole.TRIAGE, str(uuid4()))
+
+    with pytest.raises(IntegrityError):
+        await queue.defer([(event_id, "who?")], agent=stranger)
+
+    # The status change and the log row are one transaction, so neither landed.
+    assert (await queue.get(event_id)).status is Status.PENDING
+    assert await queue.history_for([event_id]) == {}
+
+
+async def test_a_sequence_assignment_shares_one_subagent(
+    queue: EventQueue, triage: Agent
+) -> None:
     ids = [await queue.submit(message(f"m{i}"), Priority.NORMAL) for i in range(3)]
-    subagent = Agent.spawn(AgentRole.SUBAGENT)
+    subagent = await queue.spawn(AgentRole.SUBAGENT)
 
     await queue.assign(
         ids,
-        agent=TRIAGE,
+        agent=triage,
         subagent=subagent,
         instructions="in order",
         action=LogAction.HANDLE_EVENT_SEQUENCE,
@@ -61,7 +108,7 @@ async def test_a_sequence_assignment_shares_one_subagent(queue: EventQueue) -> N
 
 async def test_failure_is_recorded_and_leaves_the_event_alone(queue: EventQueue) -> None:
     event_id = await queue.submit(message(), Priority.NORMAL)
-    subagent = Agent.spawn(AgentRole.SUBAGENT)
+    subagent = await queue.spawn(AgentRole.SUBAGENT)
 
     await queue.record_failure([event_id], agent=subagent, error="RuntimeError: boom")
 
@@ -72,11 +119,11 @@ async def test_failure_is_recorded_and_leaves_the_event_alone(queue: EventQueue)
 
 
 async def test_sweep_fetches_history_without_a_query_per_event(
-    queue: EventQueue,
+    queue: EventQueue, triage: Agent
 ) -> None:
     deferred = [await queue.submit(message(f"m{i}"), Priority.LOW) for i in range(5)]
     await queue.submit(message("fresh"), Priority.HIGH)
-    await queue.defer([(i, "later") for i in deferred], agent=TRIAGE)
+    await queue.defer([(i, "later") for i in deferred], agent=triage)
 
     with counting_selects() as selects:
         view = await queue.sweep_view()
@@ -86,10 +133,12 @@ async def test_sweep_fetches_history_without_a_query_per_event(
     assert set(view.history) == set(deferred)
 
 
-async def test_triage_reads_the_queue_in_one_query(queue: EventQueue) -> None:
+async def test_triage_reads_the_queue_in_one_query(
+    queue: EventQueue, triage: Agent
+) -> None:
     deferred = [await queue.submit(message(f"m{i}"), Priority.LOW) for i in range(5)]
     pending = await queue.submit(message("fresh"), Priority.HIGH)
-    await queue.defer([(i, "later") for i in deferred], agent=TRIAGE)
+    await queue.defer([(i, "later") for i in deferred], agent=triage)
 
     with counting_selects() as selects:
         view = await queue.triage_view()
@@ -101,13 +150,13 @@ async def test_triage_reads_the_queue_in_one_query(queue: EventQueue) -> None:
 
 
 async def test_deferred_history_reaches_the_sweep_prompt_not_the_triage_one(
-    queue: EventQueue,
+    queue: EventQueue, triage: Agent
 ) -> None:
     event_id = await queue.submit(message(), Priority.LOW)
-    await queue.defer([(event_id, "revisit if it goes unanswered")], agent=TRIAGE)
+    await queue.defer([(event_id, "revisit if it goes unanswered")], agent=triage)
 
-    triage = await queue.triage_view()
-    triage_prompt = PromptRenderer().triage(triage.pending, triage.deferred)
+    triage_view = await queue.triage_view()
+    triage_prompt = PromptRenderer().triage(triage_view.pending, triage_view.deferred)
     sweep = await queue.sweep_view()
     sweep_prompt = PromptRenderer().sweep(sweep.rows, sweep.history)
 
@@ -116,12 +165,14 @@ async def test_deferred_history_reaches_the_sweep_prompt_not_the_triage_one(
     assert "revisit if it goes unanswered" not in triage_prompt
     # ...the sweep gets the reasoning and who wrote it.
     assert "revisit if it goes unanswered" in sweep_prompt
-    assert TRIAGE.label in sweep_prompt
+    assert triage.label in sweep_prompt
 
 
-async def test_the_backlog_line_prefers_a_written_digest(queue: EventQueue) -> None:
+async def test_the_backlog_line_prefers_a_written_digest(
+    queue: EventQueue, triage: Agent
+) -> None:
     event_id = await queue.submit(message(), Priority.LOW)
-    await queue.defer([(event_id, "not now")], agent=TRIAGE)
+    await queue.defer([(event_id, "not now")], agent=triage)
 
     def backlog_line() -> str:
         return next(
@@ -143,10 +194,12 @@ async def test_the_backlog_line_prefers_a_written_digest(queue: EventQueue) -> N
     assert "a message" not in backlog_line()
 
 
-async def test_escalation_returns_an_event_to_triage(queue: EventQueue) -> None:
+async def test_escalation_returns_an_event_to_triage(
+    queue: EventQueue, triage: Agent
+) -> None:
     event_id = await queue.submit(message(), Priority.LOW)
-    sweeper = Agent.spawn(AgentRole.SWEEP)
-    await queue.defer([(event_id, "not yet")], agent=TRIAGE)
+    sweeper = await queue.spawn(AgentRole.SWEEP)
+    await queue.defer([(event_id, "not yet")], agent=triage)
 
     await queue.escalate(
         event_id, agent=sweeper, priority=Priority.HIGH, reason="third time round"
@@ -158,10 +211,12 @@ async def test_escalation_returns_an_event_to_triage(queue: EventQueue) -> None:
     assert view.pending[0].priority is Priority.HIGH
 
 
-async def test_archiving_from_the_sweep_is_recorded_and_final(queue: EventQueue) -> None:
+async def test_archiving_from_the_sweep_is_recorded_and_final(
+    queue: EventQueue, triage: Agent
+) -> None:
     event_id = await queue.submit(message(), Priority.BACKGROUND)
-    sweeper = Agent.spawn(AgentRole.SWEEP)
-    await queue.defer([(event_id, "automated notice")], agent=TRIAGE)
+    sweeper = await queue.spawn(AgentRole.SWEEP)
+    await queue.defer([(event_id, "automated notice")], agent=triage)
 
     await queue.archive(event_id, agent=sweeper, reason="informational, never actionable")
 

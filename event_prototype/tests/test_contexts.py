@@ -9,7 +9,7 @@ import pytest
 from anthropic import Omit
 from anthropic.types import MessageParam
 
-from event_prototype.agents import Agent, AgentRole
+from event_prototype.agents import AgentRole
 from event_prototype.config import Config
 from event_prototype.contexts import Block, PendingToolCalls, Role, Turn, to_api
 from event_prototype.events import Priority
@@ -152,20 +152,20 @@ async def test_the_stream_listing_counts_turns_without_multiplying_events(
 # -- dispatch -------------------------------------------------------------
 
 
-def dispatcher(queue: EventQueue, messages: FakeMessages) -> Dispatcher:
+async def dispatcher(queue: EventQueue, messages: FakeMessages) -> Dispatcher:
     return Dispatcher(
         queue,
         client=SimpleNamespace(messages=messages),  # type: ignore[arg-type]
         config=Config(),
         renderer=PromptRenderer(),
-        agent=Agent.spawn(AgentRole.TRIAGE),
+        agent=await queue.spawn(AgentRole.TRIAGE),
     )
 
 
 async def test_work_in_one_stream_goes_to_its_context(queue: EventQueue) -> None:
     first = await queue.submit(message("did the render finish?"), Priority.HIGH)
     messages = FakeMessages("Told her it finished.")
-    triage = dispatcher(queue, messages)
+    triage = await dispatcher(queue, messages)
 
     subagent = await triage.assign([first], "answer her", LogAction.HANDLE_ONE_EVENT)
     await triage.drain()
@@ -209,7 +209,7 @@ async def test_work_across_streams_goes_to_a_one_shot_subagent(queue: EventQueue
     here = await queue.submit(message(conversation="#workshop"), Priority.HIGH)
     there = await queue.submit(message(conversation="#general"), Priority.HIGH)
     messages = FakeMessages("Handled both.")
-    triage = dispatcher(queue, messages)
+    triage = await dispatcher(queue, messages)
 
     subagent = await triage.assign([here, there], "together", LogAction.HANDLE_EVENT_SEQUENCE)
     await triage.drain()
@@ -236,7 +236,7 @@ async def test_a_failed_call_leaves_the_events_in_the_transcript(queue: EventQue
         client=None,  # type: ignore[arg-type]
         config=Config(),
         renderer=PromptRenderer(),
-        agent=Agent.spawn(AgentRole.TRIAGE),
+        agent=await queue.spawn(AgentRole.TRIAGE),
     )
 
     await triage.assign([event_id], "answer her", LogAction.HANDLE_ONE_EVENT)

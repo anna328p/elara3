@@ -1,16 +1,17 @@
 """Who did what.
 
-Every row in the handling log is attributed to an agent. In the real framework
-an agent is a database row with a UUID and an event loop of its own; here it is
-just the identity, minted when the agent starts work and carried through to the
-log so the trail survives the process.
+Every row in the handling log is attributed to an agent, and every context is
+some agent's conversation. An agent is a row in `agents`: a UUID and a role,
+minted by the store when the agent starts work (`EventQueue.spawn`), so the
+identity exists before anything can point at it and the trail survives the
+process. `Agent` is that row's identity as it travels through the code — a
+value, not the row itself.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-from uuid import uuid4
 
 
 class AgentRole(StrEnum):
@@ -23,10 +24,6 @@ class AgentRole(StrEnum):
 class Agent:
     role: AgentRole
     id: str
-
-    @classmethod
-    def spawn(cls, role: AgentRole) -> Agent:
-        return cls(role, str(uuid4()))
 
     @property
     def label(self) -> str:

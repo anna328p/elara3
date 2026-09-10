@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from anthropic import AsyncAnthropic
 
-from .agents import Agent, AgentRole
+from .agents import AgentRole
 from .config import Config
 from .queue import EventQueue
 from .render import PromptRenderer
@@ -25,7 +25,7 @@ async def run_sweep(
 ) -> PassResult:
     """Reconsider every deferred event, then wait for anything it dispatched."""
     renderer = renderer or PromptRenderer()
-    agent = Agent.spawn(AgentRole.SWEEP)
+    agent = await queue.spawn(AgentRole.SWEEP)
 
     view = await queue.sweep_view()
     if not view.rows:
