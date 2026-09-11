@@ -1,8 +1,8 @@
 """One backlog sweep: what the deferred events are actually worth.
 
 Where triage is fast and sees only what is live, the sweep is slow, runs on a
-schedule or in idle time, and sees the deferred backlog with the full log of
-what has been decided about each event. It is the only pass that can archive.
+schedule or in idle time, and sees the deferred backlog with every action
+taken on each event so far. It is the only pass that can archive.
 """
 
 from __future__ import annotations

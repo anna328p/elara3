@@ -9,7 +9,7 @@ import pytest
 from event_prototype.agents import Agent, AgentRole
 from event_prototype.events import JobEvent, Priority, ScheduledEvent
 from event_prototype.queue import EventNotFound, EventQueue
-from event_prototype.store import LogAction, Status, utcnow
+from event_prototype.store import Action, Status, utcnow
 
 from conftest import message
 
@@ -69,7 +69,7 @@ async def test_completed_events_leave_the_active_list_but_keep_their_report(
     assert (await queue.get(event_id)).status is Status.COMPLETED
 
     (entry,) = (await queue.history_for([event_id]))[event_id]
-    assert entry.action is LogAction.REPORT
+    assert entry.action is Action.REPORT
     assert entry.detail == "replied in #workshop"
     assert entry.agent == subagent
 

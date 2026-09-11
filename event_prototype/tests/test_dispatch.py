@@ -11,7 +11,7 @@ from event_prototype.config import Config
 from event_prototype.events import JobEvent, Priority, ScheduledEvent
 from event_prototype.queue import EventQueue
 from event_prototype.render import PromptRenderer
-from event_prototype.store import LogAction, Status, utcnow
+from event_prototype.store import Action, Status, utcnow
 from event_prototype.tools import Dispatcher
 
 from conftest import FakeMessages, message
@@ -36,11 +36,11 @@ async def test_an_event_gets_only_one_disposition_per_pass(queue: EventQueue) ->
 
     # A second, contradictory call is refused rather than quietly overwriting.
     with pytest.raises(ValueError, match="already given a disposition"):
-        await triage.assign([event_id], "actually, do it", LogAction.HANDLE_ONE_EVENT)
+        await triage.assign([event_id], "actually, do it", Action.HANDLE_ONE_EVENT)
 
     assert (await queue.get(event_id)).status is Status.DEFERRED
     (entry,) = (await queue.history_for([event_id]))[event_id]
-    assert entry.action is LogAction.DEFER_EVENT
+    assert entry.action is Action.DEFER_EVENT
 
 
 async def test_a_rejected_disposition_leaves_the_batch_untouched(
@@ -53,7 +53,7 @@ async def test_a_rejected_disposition_leaves_the_batch_untouched(
     await triage.defer(first, "not now")
 
     with pytest.raises(ValueError):
-        await triage.assign([second, first], "together", LogAction.HANDLE_EVENT_SEQUENCE)
+        await triage.assign([second, first], "together", Action.HANDLE_EVENT_SEQUENCE)
 
     # The untainted event in the batch is still free for a later disposition.
     assert await queue.history_for([second]) == {}
@@ -122,7 +122,7 @@ async def test_an_assignment_records_the_streams_it_spanned(queue: EventQueue) -
     triage = await dispatcher(queue)
 
     # No client, so the subagent fails — the streams are recorded either way.
-    await triage.assign([job, question], "answer her", LogAction.HANDLE_EVENT_SEQUENCE)
+    await triage.assign([job, question], "answer her", Action.HANDLE_EVENT_SEQUENCE)
     await triage.drain()
 
     (disposition,) = triage.dispositions
@@ -138,7 +138,7 @@ async def test_a_streamless_event_contributes_no_stream(queue: EventQueue) -> No
     )
     triage = await dispatcher(queue)
 
-    await triage.assign([alarm], "do it", LogAction.HANDLE_ONE_EVENT)
+    await triage.assign([alarm], "do it", Action.HANDLE_ONE_EVENT)
     await triage.drain()
 
     (disposition,) = triage.dispositions

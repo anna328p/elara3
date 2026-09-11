@@ -1,6 +1,6 @@
 """Who did what.
 
-Every row in the handling log is attributed to an agent, and every context is
+Every action taken on an event is attributed to an agent, and every context is
 some agent's conversation. An agent is a row in `agents`: a UUID and a role,
 minted by the store when the agent starts work (`EventQueue.spawn`), so the
 identity exists before anything can point at it and the trail survives the

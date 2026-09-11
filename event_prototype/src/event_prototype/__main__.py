@@ -89,7 +89,7 @@ async def _seed(config: Config, *, fresh: bool) -> None:
 async def _list(config: Config, *, show_all: bool) -> None:
     async with await EventQueue.open(config.db_path) as queue:
         rows = await queue.list_events(active_only=not show_all)
-        # One query for the whole log slice, not one per event.
+        # One query for the whole slice of actions, not one per event.
         history = await queue.history_for([row.id for row in rows])
 
     if not rows:

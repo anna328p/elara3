@@ -1,4 +1,4 @@
-"""The handling log: what happened to an event, in order, and who did it."""
+"""Event actions: what happened to an event, in order, and who did it."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from event_prototype.agents import Agent, AgentRole
 from event_prototype.events import Priority
 from event_prototype.queue import EventQueue
 from event_prototype.render import PromptRenderer
-from event_prototype.store import LogAction, Status
+from event_prototype.store import Action, Status
 
 from conftest import counting_selects, message
 
@@ -23,7 +23,7 @@ async def test_an_events_history_reads_as_a_sequence(
 
     await queue.defer([(event_id, "no rush")], agent=triage)
     assignment = await queue.assign(
-        [event_id], agent=triage, instructions="answer her", action=LogAction.HANDLE_ONE_EVENT
+        [event_id], agent=triage, instructions="answer her", action=Action.HANDLE_ONE_EVENT
     )
     subagent = assignment.subagent
     await queue.complete([event_id], agent=subagent, report="answered")
@@ -31,9 +31,9 @@ async def test_an_events_history_reads_as_a_sequence(
     entries = (await queue.history_for([event_id]))[event_id]
 
     assert [e.action for e in entries] == [
-        LogAction.DEFER_EVENT,
-        LogAction.HANDLE_ONE_EVENT,
-        LogAction.REPORT,
+        Action.DEFER_EVENT,
+        Action.HANDLE_ONE_EVENT,
+        Action.REPORT,
     ]
     # The assignment names both ends: who decided, and who got the work.
     assert entries[1].agent == triage
@@ -47,7 +47,7 @@ async def test_the_agents_on_an_entry_come_with_the_entry(
     """Roles live on the agent row now, and reading them costs no extra query."""
     event_id = await queue.submit(message(), Priority.NORMAL)
     assignment = await queue.assign(
-        [event_id], agent=triage, instructions="answer her", action=LogAction.HANDLE_ONE_EVENT
+        [event_id], agent=triage, instructions="answer her", action=Action.HANDLE_ONE_EVENT
     )
     subagent = assignment.subagent
 
@@ -72,7 +72,7 @@ async def test_nothing_is_attributed_to_an_agent_the_store_never_minted(
     with pytest.raises(IntegrityError):
         await queue.defer([(event_id, "who?")], agent=stranger)
 
-    # The status change and the log row are one transaction, so neither landed.
+    # The status change and the action row are one transaction, so neither landed.
     assert (await queue.get(event_id)).status is Status.PENDING
     assert await queue.history_for([event_id]) == {}
 
@@ -83,7 +83,7 @@ async def test_a_sequence_assignment_shares_one_subagent(
     ids = [await queue.submit(message(f"m{i}"), Priority.NORMAL) for i in range(3)]
 
     assignment = await queue.assign(
-        ids, agent=triage, instructions="in order", action=LogAction.HANDLE_EVENT_SEQUENCE
+        ids, agent=triage, instructions="in order", action=Action.HANDLE_EVENT_SEQUENCE
     )
     subagent = assignment.subagent
 
@@ -102,7 +102,7 @@ async def test_failure_is_recorded_and_leaves_the_event_alone(queue: EventQueue)
 
     assert (await queue.get(event_id)).status is Status.PENDING
     (entry,) = (await queue.history_for([event_id]))[event_id]
-    assert entry.action is LogAction.FAILED
+    assert entry.action is Action.FAILED
     assert "boom" in entry.detail
 
 
@@ -116,7 +116,7 @@ async def test_sweep_fetches_history_without_a_query_per_event(
     with counting_selects() as selects:
         view = await queue.sweep_view()
 
-    assert len(selects) == 2, selects  # one for events, one for the whole log slice
+    assert len(selects) == 2, selects  # one for events, one for the whole slice of actions
     assert [row.id for row in view.rows] == deferred  # the pending one is not swept
     assert set(view.history) == set(deferred)
 
@@ -211,5 +211,5 @@ async def test_archiving_from_the_sweep_is_recorded_and_final(
     assert (await queue.sweep_view()).rows == []
     assert (await queue.triage_view()).deferred == []
     entries = (await queue.history_for([event_id]))[event_id]
-    assert entries[-1].action is LogAction.ARCHIVE_EVENT
+    assert entries[-1].action is Action.ARCHIVE_EVENT
     assert entries[-1].agent == sweeper

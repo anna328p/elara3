@@ -13,11 +13,11 @@ from datetime import datetime, timedelta
 
 from jinja2 import Environment, PackageLoader, StrictUndefined
 
-from .store import EventLogRow, EventRow, utcnow
+from .store import ActionRow, EventRow, utcnow
 
 
 @dataclass(frozen=True, slots=True)
-class LogView:
+class ActionView:
     """One past action on an event, flattened for a template."""
 
     timestamp: str
@@ -26,7 +26,7 @@ class LogView:
     detail: str
 
     @classmethod
-    def of(cls, entry: EventLogRow) -> LogView:
+    def of(cls, entry: ActionRow) -> ActionView:
         return cls(
             timestamp=entry.timestamp.isoformat(timespec="seconds"),
             action=entry.action.value,
@@ -53,11 +53,11 @@ class EventView:
     #: The ongoing context this event belongs to, as a prompt reads it. `None`
     #: for events that belong to nothing ongoing.
     stream: str | None = None
-    history: tuple[LogView, ...] = ()
+    history: tuple[ActionView, ...] = ()
 
     @classmethod
     def of(
-        cls, row: EventRow, now: datetime, history: Sequence[EventLogRow] = ()
+        cls, row: EventRow, now: datetime, history: Sequence[ActionRow] = ()
     ) -> EventView:
         return cls(
             id=row.id,
@@ -70,7 +70,7 @@ class EventView:
             payload=json.dumps(row.payload, indent=2, sort_keys=True, ensure_ascii=False),
             summary=row.digest or row.description,
             stream=row.stream.title if row.stream else None,
-            history=tuple(LogView.of(entry) for entry in history),
+            history=tuple(ActionView.of(entry) for entry in history),
         )
 
 
@@ -122,7 +122,7 @@ class PromptRenderer:
     def sweep(
         self,
         rows: Sequence[EventRow],
-        history: Mapping[int, Sequence[EventLogRow]],
+        history: Mapping[int, Sequence[ActionRow]],
         *,
         now: datetime | None = None,
     ) -> str:

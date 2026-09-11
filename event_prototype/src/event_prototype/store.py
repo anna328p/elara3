@@ -1,6 +1,6 @@
 """SQLite persistence for the event queue.
 
-`events` is current state and `event_log` the append-only record of what was
+`events` is current state and `event_actions` the append-only record of what was
 decided about each one and by whom — "whom" being a row in `agents`, which every
 attribution points at. `streams` is the ongoing loci events belong to, each
 routed to at most one `contexts` row: the conversation an agent is having there,
@@ -50,8 +50,8 @@ class Status(StrEnum):
     COMPLETED = "completed"
 
 
-class LogAction(StrEnum):
-    """What was done to an event. Most correspond one-to-one with model tools."""
+class Action(StrEnum):
+    """What an agent did about an event. Most correspond one-to-one with model tools."""
 
     # triage
     HANDLE_ONE_EVENT = "handle_one_event"
@@ -146,7 +146,7 @@ class StreamRow(Base):
 
 
 class AgentRow(Base):
-    """An agent: the thing log entries are attributed to and contexts belong to.
+    """An agent: the thing actions are attributed to and contexts belong to.
 
     Nothing more than an identity and a role for now. In the real framework
     this row grows an event loop, a name, a budget; here it exists so that
@@ -180,7 +180,7 @@ class ContextRow(Base):
 
     #: Whose conversation this is. Minted when the context opens and kept, so
     #: returning work in a stream reaches the same subagent — the identity in
-    #: the event log and the memory in the transcript are the same thing.
+    #: `event_actions` and the memory in the transcript are the same thing.
     agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id"))
     #: Joined, for the same reason as `EventRow.stream`: rows outlive their
     #: session, and many-to-one costs nothing extra in the same SELECT.
@@ -261,8 +261,8 @@ class EventRow(Base):
         SAEnum(Status, native_enum=False, length=16), default=Status.PENDING
     )
 
-    # Why an event is in the state it is lives in `event_log`, not here — the
-    # row carries current state, the log carries the reasoning behind it.
+    # Why an event is in the state it is lives in `event_actions`, not here — the
+    # row carries current state, the actions carry the reasoning behind it.
 
     #: One line standing in for this event on triage's backlog list, written
     #: when it is set aside and rewritten whenever that reasoning changes.
@@ -285,23 +285,23 @@ class EventRow(Base):
         )
 
 
-class EventLogRow(Base):
+class ActionRow(Base):
     """One thing an agent did about one event. Append-only."""
 
-    __tablename__ = "event_log"
+    __tablename__ = "event_actions"
     __table_args__ = (
         # Every read is "the history of these events, oldest first".
-        Index("ix_event_log_event_timestamp", "event_id", "timestamp"),
+        Index("ix_event_actions_event_timestamp", "event_id", "timestamp"),
         # ...and occasionally "everything this agent touched".
-        Index("ix_event_log_agent", "agent_id"),
+        Index("ix_event_actions_agent", "agent_id"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     event_id: Mapped[int] = mapped_column(ForeignKey("events.id"))
     timestamp: Mapped[datetime] = mapped_column(default=utcnow)
 
-    action: Mapped[LogAction] = mapped_column(
-        SAEnum(LogAction, native_enum=False, length=32)
+    action: Mapped[Action] = mapped_column(
+        SAEnum(Action, native_enum=False, length=32)
     )
     #: The triage model's reason or instructions, or the subagent's report.
     detail: Mapped[str]
@@ -312,7 +312,7 @@ class EventLogRow(Base):
     assigned_agent_id: Mapped[str | None] = mapped_column(
         ForeignKey("agents.id"), default=None
     )
-    # Both joined: the log is read to be rendered, after its session is gone,
+    # Both joined: actions are read to be rendered, after their session is gone,
     # and the role that `label` needs lives on the agent row now. Two foreign
     # keys into one table, so each relationship has to say which is its own.
     actor: Mapped[AgentRow] = relationship(lazy="joined", foreign_keys=[agent_id])
@@ -330,7 +330,7 @@ class EventLogRow(Base):
 
     def __repr__(self) -> str:
         return (
-            f"EventLogRow(event_id={self.event_id}, action={self.action.value}, "
+            f"ActionRow(event_id={self.event_id}, action={self.action.value}, "
             f"agent={self.agent.label!r})"
         )
 
@@ -366,7 +366,7 @@ async def spawn_agent(session: AsyncSession, role: AgentRole) -> AgentRow:
 
     This is the only way an agent comes into being, so nothing can be
     attributed to one the store has never heard of — the foreign keys on
-    `event_log` and `contexts` see to the rest.
+    `event_actions` and `contexts` see to the rest.
     """
     row = AgentRow(role=role)
     session.add(row)

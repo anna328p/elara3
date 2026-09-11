@@ -4,7 +4,7 @@ has to be quick about it; you are the pass that decides what these are actually
 worth, with the whole history in front of you and no one waiting on you.
 
 The current time is {{ now }}. There are {{ events | length }} deferred events,
-most urgent first. Each carries the log of what has been decided about it.
+most urgent first. Each carries the actions taken on it so far.
 
 {% for event in events %}
 <event id="{{ event.id }}" kind="{{ event.kind }}" priority="{{ event.priority }}"{% if event.stream %} stream="{{ event.stream }}"{% endif %}>
@@ -28,7 +28,7 @@ Give every event above exactly one disposition:
 - `handle_event` — this needs work now and is self-contained enough to hand
   straight to a subagent, without waiting for the next triage.
 - `archive_event` — this will never need action. Archiving retires the event: it
-  drops out of the queue for good and survives only in the log. Say why, because
+  drops out of the queue for good and survives only in its action record. Say why, because
   that reason is the last word on it.
 - `keep_deferred` — still not worth acting on, and not yet safe to retire. Give
   the reason as it stands now, not a copy of the old one, and say what would

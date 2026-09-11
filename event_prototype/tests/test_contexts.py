@@ -15,7 +15,7 @@ from event_prototype.contexts import Block, PendingToolCalls, Role, Turn, to_api
 from event_prototype.events import Priority
 from event_prototype.queue import EventQueue
 from event_prototype.render import PromptRenderer
-from event_prototype.store import LogAction, Status
+from event_prototype.store import Action, Status
 from event_prototype.tools import Dispatcher
 
 from conftest import FakeMessages, completion, counting_selects, message
@@ -167,7 +167,7 @@ async def test_work_in_one_stream_goes_to_its_context(queue: EventQueue) -> None
     messages = FakeMessages("Told her it finished.")
     triage = await dispatcher(queue, messages)
 
-    subagent = await triage.assign([first], "answer her", LogAction.HANDLE_ONE_EVENT)
+    subagent = await triage.assign([first], "answer her", Action.HANDLE_ONE_EVENT)
     await triage.drain()
 
     # The subagent is the context's agent, and the same one next time round.
@@ -179,8 +179,8 @@ async def test_work_in_one_stream_goes_to_its_context(queue: EventQueue) -> None
     second = await queue.submit(message("and the alpha channel?"), Priority.HIGH)
     messages.text = "Yes, preserved, as I said it finished."
     with counting_selects() as selects:
-        assert await triage.assign([second], "follow up", LogAction.HANDLE_ONE_EVENT) == subagent
-    # Routed and logged in one transaction: the rows (their streams ride along),
+        assert await triage.assign([second], "follow up", Action.HANDLE_ONE_EVENT) == subagent
+    # Routed and recorded in one transaction: the rows (their streams ride along),
     # the routing pairs, the context — nothing fetched again between steps.
     assert len(selects) == 3, selects
     await triage.drain()
@@ -199,7 +199,7 @@ async def test_work_in_one_stream_goes_to_its_context(queue: EventQueue) -> None
     assert messages.calls[1]["system"] == PromptRenderer().subagent_system()
     assert messages.calls[1]["cache_control"] == {"type": "ephemeral"}
 
-    # And the log shows one subagent handling the stream twice.
+    # And the actions show one subagent handling the stream twice.
     history = await queue.history_for([first, second])
     assigned = {e.assigned_agent_id for entries in history.values() for e in entries if e.assigned_agent_id}
     assert assigned == {subagent.id}
@@ -215,7 +215,7 @@ async def test_work_across_streams_goes_to_a_one_shot_subagent(queue: EventQueue
     messages = FakeMessages("Handled both.")
     triage = await dispatcher(queue, messages)
 
-    subagent = await triage.assign([here, there], "together", LogAction.HANDLE_EVENT_SEQUENCE)
+    subagent = await triage.assign([here, there], "together", Action.HANDLE_EVENT_SEQUENCE)
     await triage.drain()
 
     # No stream was routed, nothing was written, and nothing asked to be cached.
@@ -229,7 +229,7 @@ async def test_work_across_streams_goes_to_a_one_shot_subagent(queue: EventQueue
     assert outcome.report == "Handled both."
     # A later assignment in one of those streams opens a context with a new agent.
     later = await queue.submit(message(conversation="#workshop"), Priority.HIGH)
-    assert await triage.assign([later], "again", LogAction.HANDLE_ONE_EVENT) != subagent
+    assert await triage.assign([later], "again", Action.HANDLE_ONE_EVENT) != subagent
     await triage.drain()
 
 
@@ -237,7 +237,7 @@ async def test_streams_that_share_a_context_route_to_it(queue: EventQueue) -> No
     first = await queue.submit(message(conversation="#workshop"), Priority.HIGH)
     messages = FakeMessages("On it.")
     triage = await dispatcher(queue, messages)
-    subagent = await triage.assign([first], "answer her", LogAction.HANDLE_ONE_EVENT)
+    subagent = await triage.assign([first], "answer her", Action.HANDLE_ONE_EVENT)
     await triage.drain()
     workshop = (await queue.get(first)).stream_id
     assert workshop is not None
@@ -251,7 +251,7 @@ async def test_streams_that_share_a_context_route_to_it(queue: EventQueue) -> No
     here = await queue.submit(message(conversation="#workshop"), Priority.HIGH)
 
     messages.text = "Both handled."
-    assert await triage.assign([there, here], "together", LogAction.HANDLE_EVENT_SEQUENCE) == subagent
+    assert await triage.assign([there, here], "together", Action.HANDLE_EVENT_SEQUENCE) == subagent
     await triage.drain()
 
     # The one transcript grew by the two events, the brief, and the reply.
@@ -273,7 +273,7 @@ async def test_a_failed_call_leaves_the_events_in_the_transcript(queue: EventQue
         agent=await queue.spawn(AgentRole.TRIAGE),
     )
 
-    await triage.assign([event_id], "answer her", LogAction.HANDLE_ONE_EVENT)
+    await triage.assign([event_id], "answer her", Action.HANDLE_ONE_EVENT)
     await triage.drain()
 
     stream_id = (await queue.get(event_id)).stream_id

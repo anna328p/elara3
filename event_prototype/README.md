@@ -58,8 +58,8 @@ has the dispositions that triage should not be making in a hurry:
 - `archive_event` — this will never need action
 - `keep_deferred` — still not worth acting on, with a fresh account of why
 
-**Archived** is nobody's. The event drops out of both passes and survives in the
-log and `list --all`.
+**Archived** is nobody's. The event drops out of both passes and survives in
+`event_actions` and `list --all`.
 
 ## Streams
 
@@ -169,15 +169,15 @@ a dispatcher, and both are passed in explicitly.
 
 ## State and record
 
-`events` holds current state, one row per event. `event_log` is the append-only
+`events` holds current state, one row per event. `event_actions` is the append-only
 record of what was decided about each one: a timestamp, the action, the reason or
 instructions, and the agent it is attributed to. Assignments also name the
 subagent the work went to, so a dispatch and the report that follows it can be
-tied together. State changes and their log rows are written in the same
+tied together. State changes and their action rows are written in the same
 transaction, so status and reasoning can never disagree.
 
 `agents` is what those attributions point at: one row per agent, holding its
-role, minted by the store when the agent starts work. The log and `contexts`
+role, minted by the store when the agent starts work. `event_actions` and `contexts`
 reference it by foreign key, and SQLite is told to enforce them, so nothing can
 be attributed to an agent that was never minted and the role is written once.
 
@@ -188,21 +188,21 @@ copy would be one more thing that can be wrong — and would be, since events do
 not arrive in the order they happened.
 
 `contexts` holds the agent whose conversation it is, and `turns` the
-conversation, ordered by id within a context in the same way `event_log` is
+conversation, ordered by id within a context in the same way `event_actions` is
 ordered within an event. Turns are appended before the subagent is called and
 after it replies, so a call that fails leaves the events it was shown in the
-transcript, which is what happened; the failure itself goes to the event log.
+transcript, which is what happened; the failure itself goes to `event_actions`.
 
 Reads are indexed on `(event_id, timestamp)` and never go per-event. Triage is a
 single query, since the digest needs no history at all; the sweep is two, one for
-the events and one for the whole slice of log they point at, however large the
+the events and one for the whole slice of actions they point at, however large the
 backlog. An event's stream rides along in those same statements — the join is
 declared on the relationship rather than requested at each call site, so it
 cannot be forgotten on a path that later renders a prompt, and the counts above
 are the ones the tests assert.
 
 Events are never deleted. Archiving stamps `archived_at` and drops the event from
-both passes, but `list --all` still shows it, log and all.
+both passes, but `list --all` still shows it, actions and all.
 
 ## What it doesn't do
 

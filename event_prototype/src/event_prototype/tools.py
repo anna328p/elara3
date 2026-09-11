@@ -25,7 +25,7 @@ from .digest import summarize
 from .events import Priority
 from .queue import Assignment, EventQueue
 from .render import PromptRenderer
-from .store import EventRow, LogAction
+from .store import Action, EventRow
 from .subagent import report_of, run_subagent
 
 #: How the models name a priority level, since the stored value is an integer.
@@ -36,11 +36,11 @@ type PriorityName = Literal["background", "low", "normal", "high", "realtime"]
 class Disposition:
     """What triage decided about a set of events, and how it turned out.
 
-    The durable record is the event log; this is the in-memory account of a
+    The durable record is `event_actions`; this is the in-memory account of a
     single pass, for the report printed at the end of it.
     """
 
-    action: LogAction
+    action: Action
     event_ids: list[int]
     detail: str
     agent: Agent | None = None
@@ -72,14 +72,14 @@ class Dispatcher:
     _tasks: set[asyncio.Task[None]] = field(default_factory=lambda: set(), init=False, repr=False)
     #: What each event has already been given this pass, so it cannot be
     #: given a second, contradictory one.
-    _claimed: dict[int, LogAction] = field(default_factory=lambda: {}, init=False, repr=False)
+    _claimed: dict[int, Action] = field(default_factory=lambda: {}, init=False, repr=False)
 
     async def drain(self) -> None:
         """Wait for every spawned subagent to finish."""
         while self._tasks:
             await asyncio.gather(*tuple(self._tasks))
 
-    def _claim(self, event_ids: Sequence[int], action: LogAction) -> None:
+    def _claim(self, event_ids: Sequence[int], action: Action) -> None:
         """Reserve these events for `action`, or say who got there first."""
         for event_id in event_ids:
             if (held := self._claimed.get(event_id)) is not None:
@@ -91,11 +91,11 @@ class Dispatcher:
         self._claimed.update(dict.fromkeys(event_ids, action))
 
     async def assign(
-        self, event_ids: Sequence[int], instructions: str, action: LogAction
+        self, event_ids: Sequence[int], instructions: str, action: Action
     ) -> Agent:
         """Hand events to a subagent and start it working.
 
-        The queue decides where they go (see `store.route`) and logs the
+        The queue decides where they go (see `store.route`) and records the
         assignment before the task is spawned, so the record exists even if
         handling never finishes.
         """
@@ -107,27 +107,27 @@ class Dispatcher:
         return assignment.subagent
 
     async def defer(self, event_id: int, reason: str) -> None:
-        self._claim([event_id], LogAction.DEFER_EVENT)
+        self._claim([event_id], Action.DEFER_EVENT)
         await self.queue.defer([(event_id, reason)], agent=self.agent)
-        self._record(LogAction.DEFER_EVENT, event_id, reason)
+        self._record(Action.DEFER_EVENT, event_id, reason)
         self._spawn(self._write_digest(event_id, reason))
 
     async def escalate(self, event_id: int, priority: Priority, reason: str) -> None:
-        self._claim([event_id], LogAction.ESCALATE_EVENT)
+        self._claim([event_id], Action.ESCALATE_EVENT)
         await self.queue.escalate(
             event_id, agent=self.agent, priority=priority, reason=reason
         )
-        self._record(LogAction.ESCALATE_EVENT, event_id, f"[{priority.name.lower()}] {reason}")
+        self._record(Action.ESCALATE_EVENT, event_id, f"[{priority.name.lower()}] {reason}")
 
     async def archive(self, event_id: int, reason: str) -> None:
-        self._claim([event_id], LogAction.ARCHIVE_EVENT)
+        self._claim([event_id], Action.ARCHIVE_EVENT)
         await self.queue.archive(event_id, agent=self.agent, reason=reason)
-        self._record(LogAction.ARCHIVE_EVENT, event_id, reason)
+        self._record(Action.ARCHIVE_EVENT, event_id, reason)
 
     async def keep_deferred(self, event_id: int, reason: str) -> None:
-        self._claim([event_id], LogAction.KEEP_DEFERRED)
+        self._claim([event_id], Action.KEEP_DEFERRED)
         await self.queue.keep_deferred(event_id, agent=self.agent, reason=reason)
-        self._record(LogAction.KEEP_DEFERRED, event_id, reason)
+        self._record(Action.KEEP_DEFERRED, event_id, reason)
         self._spawn(self._write_digest(event_id, reason))
 
     async def _write_digest(self, event_id: int, reason: str) -> None:
@@ -145,7 +145,7 @@ class Dispatcher:
         except Exception:
             return
 
-    def _record(self, action: LogAction, event_id: int, detail: str) -> None:
+    def _record(self, action: Action, event_id: int, detail: str) -> None:
         self.dispositions.append(Disposition(action, [event_id], detail, agent=self.agent))
 
     def _spawn(self, coro: Coroutine[Any, Any, None]) -> None:
@@ -153,7 +153,7 @@ class Dispatcher:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
-    async def _handle(self, assignment: Assignment, instructions: str, action: LogAction) -> None:
+    async def _handle(self, assignment: Assignment, instructions: str, action: Action) -> None:
         """Run one subagent over the assigned rows and record what came back.
 
         With a context, the events and the brief are appended to it before the
@@ -221,7 +221,7 @@ def build_triage_server(dispatcher: Dispatcher) -> MCPServer:
                 context from the queue it needs.
         """
         subagent = await dispatcher.assign(
-            [event_id], instructions, LogAction.HANDLE_ONE_EVENT
+            [event_id], instructions, Action.HANDLE_ONE_EVENT
         )
         return f"Event {event_id} assigned to {subagent.label}."
 
@@ -238,7 +238,7 @@ def build_triage_server(dispatcher: Dispatcher) -> MCPServer:
             instructions: The subagent's brief covering the whole group.
         """
         subagent = await dispatcher.assign(
-            event_ids, instructions, LogAction.HANDLE_EVENT_SEQUENCE
+            event_ids, instructions, Action.HANDLE_EVENT_SEQUENCE
         )
         listed = ", ".join(str(i) for i in event_ids)
         return f"Events {listed} assigned to {subagent.label}, in that order."
@@ -296,7 +296,7 @@ def build_sweep_server(dispatcher: Dispatcher) -> MCPServer:
                 instructions, so include anything from the history it needs.
         """
         subagent = await dispatcher.assign(
-            [event_id], instructions, LogAction.HANDLE_ONE_EVENT
+            [event_id], instructions, Action.HANDLE_ONE_EVENT
         )
         return f"Event {event_id} assigned to {subagent.label}."
 
@@ -305,7 +305,7 @@ def build_sweep_server(dispatcher: Dispatcher) -> MCPServer:
         """Retire an event that will never need action.
 
         Archiving drops the event from the queue for good; it survives only in
-        the log. Nothing undoes it, so be sure the event can never matter rather
+        its action record. Nothing undoes it, so be sure the event can never matter rather
         than merely not mattering today, and never archive something a person is
         waiting on.
 

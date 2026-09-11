@@ -3,7 +3,7 @@
 Owns its engine and session factory; callers hold a queue and pass it around
 explicitly. Nothing here reads global state.
 
-Every state change is paired with a log row in the same transaction, so an
+Every state change is paired with an action row in the same transaction, so an
 event's status and the reasoning behind it can never disagree.
 """
 
@@ -23,10 +23,10 @@ from .agents import Agent, AgentRole
 from .contexts import Turn
 from .events import Event, Priority
 from .store import (
+    Action,
+    ActionRow,
     ContextRow,
-    EventLogRow,
     EventRow,
-    LogAction,
     Status,
     StreamNotFound,
     StreamRow,
@@ -42,11 +42,11 @@ from .store import (
     utcnow,
 )
 
-#: An event's log entries, oldest first, keyed by event id.
-type History = dict[int, list[EventLogRow]]
+#: An event's actions, oldest first, keyed by event id.
+type History = dict[int, list[ActionRow]]
 
 #: An event id paired with the text recorded against it.
-type LogEntry = tuple[int, str]
+type EventDetail = tuple[int, str]
 
 
 class EventNotFound(KeyError):
@@ -177,13 +177,13 @@ class EventQueue:
     async def archive(self, event_id: int, *, agent: Agent, reason: str) -> EventRow:
         """Retire an event from view. This is as close to deletion as we get.
 
-        Archived events appear only in the full history listing and the log,
+        Archived events appear only in the full history listing and `event_actions`,
         which is why the reason is required: it is the last word on the event.
         """
         async with self._sessions.begin() as session:
             (row,) = await self._require(session, [event_id])
             row.archived_at = utcnow()
-            self._append(session, [(event_id, reason)], LogAction.ARCHIVE_EVENT, agent)
+            self._append(session, [(event_id, reason)], Action.ARCHIVE_EVENT, agent)
             return row
 
     # -- dispositions ------------------------------------------------------
@@ -197,11 +197,11 @@ class EventQueue:
         *,
         agent: Agent,
         instructions: str,
-        action: LogAction,
+        action: Action,
     ) -> Assignment:
-        """Route these events, mint a subagent if none is theirs, and log the handoff.
+        """Route these events, mint a subagent if none is theirs, and record the handoff.
 
-        One transaction: a context opened here exists only alongside the log
+        One transaction: a context opened here exists only alongside the action
         rows that point at its agent, and a crash mid-handling still leaves
         evidence of what was attempted.
         """
@@ -225,10 +225,10 @@ class EventQueue:
             for row in await self._require(session, event_ids):
                 row.status = Status.COMPLETED
             self._append(
-                session, [(i, report) for i in event_ids], LogAction.REPORT, agent
+                session, [(i, report) for i in event_ids], Action.REPORT, agent
             )
 
-    async def defer(self, deferrals: Sequence[LogEntry], *, agent: Agent) -> None:
+    async def defer(self, deferrals: Sequence[EventDetail], *, agent: Agent) -> None:
         """Move events out of triage's working set and into the sweep's.
 
         Each event carries its own reason: the entry is read back as that
@@ -237,7 +237,7 @@ class EventQueue:
         async with self._sessions.begin() as session:
             for row in await self._require(session, [i for i, _ in deferrals]):
                 row.status = Status.DEFERRED
-            self._append(session, deferrals, LogAction.DEFER_EVENT, agent)
+            self._append(session, deferrals, Action.DEFER_EVENT, agent)
 
     async def escalate(
         self, event_id: int, *, agent: Agent, priority: Priority, reason: str
@@ -247,7 +247,7 @@ class EventQueue:
             (row,) = await self._require(session, [event_id])
             row.status = Status.PENDING
             row.priority = priority
-            self._append(session, [(event_id, reason)], LogAction.ESCALATE_EVENT, agent)
+            self._append(session, [(event_id, reason)], Action.ESCALATE_EVENT, agent)
 
     async def set_digest(self, event_id: int, digest: str) -> None:
         """Cache the line that stands in for this event on the backlog list."""
@@ -259,7 +259,7 @@ class EventQueue:
         """Leave a deferred event where it is, with a fresh look at why."""
         async with self._sessions.begin() as session:
             await self._require(session, [event_id])
-            self._append(session, [(event_id, reason)], LogAction.KEEP_DEFERRED, agent)
+            self._append(session, [(event_id, reason)], Action.KEEP_DEFERRED, agent)
 
     async def record_failure(
         self, event_ids: Sequence[int], *, agent: Agent, error: str
@@ -267,7 +267,7 @@ class EventQueue:
         """Note that handling fell over. The events keep their current status."""
         async with self._sessions.begin() as session:
             self._append(
-                session, [(i, error) for i in event_ids], LogAction.FAILED, agent
+                session, [(i, error) for i in event_ids], Action.FAILED, agent
             )
 
     # -- reading -----------------------------------------------------------
@@ -306,7 +306,7 @@ class EventQueue:
         """The deferred backlog with its full history.
 
         Two queries regardless of backlog size: one for the events, one for the
-        whole slice of log they point at.
+        whole slice of `event_actions` they point at.
         """
         async with self._sessions() as session:
             query = self._events_query().where(EventRow.status == Status.DEFERRED)
@@ -345,7 +345,7 @@ class EventQueue:
         ]
 
     async def history_for(self, event_ids: Sequence[int]) -> History:
-        """Log entries for these events, oldest first. One query."""
+        """The actions taken on these events, oldest first. One query."""
         async with self._sessions() as session:
             return await self._history(session, event_ids)
 
@@ -405,14 +405,14 @@ class EventQueue:
     @staticmethod
     def _append(
         session: AsyncSession,
-        entries: Sequence[LogEntry],
-        action: LogAction,
+        entries: Sequence[EventDetail],
+        action: Action,
         agent: Agent,
         *,
         assigned: Agent | None = None,
     ) -> None:
         session.add_all(
-            EventLogRow(
+            ActionRow(
                 event_id=event_id,
                 action=action,
                 detail=detail,
@@ -427,9 +427,9 @@ class EventQueue:
         if not event_ids:
             return {}
         query = (
-            select(EventLogRow)
-            .where(EventLogRow.event_id.in_(event_ids))
-            .order_by(EventLogRow.timestamp.asc(), EventLogRow.id.asc())
+            select(ActionRow)
+            .where(ActionRow.event_id.in_(event_ids))
+            .order_by(ActionRow.timestamp.asc(), ActionRow.id.asc())
         )
         grouped: History = {}
         for entry in (await session.scalars(query)).all():

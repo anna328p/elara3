@@ -45,7 +45,7 @@ async def run_subagent(
 
 
 def report_of(response: Message) -> str:
-    """What the subagent said it did, as the event log records it."""
+    """What the subagent said it did, as `event_actions` records it."""
     if response.stop_reason == "refusal":
         return "[subagent declined to handle this event]"
     return Turn.of(response).text

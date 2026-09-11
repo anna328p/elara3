@@ -4,19 +4,19 @@ from .agents import Agent, AgentRole
 from .config import Config
 from .events import Event, JobEvent, MessageEvent, Priority, ScheduledEvent
 from .queue import EventNotFound, EventQueue, SweepView, TriageView
-from .store import EventLogRow, EventRow, LogAction, Status
+from .store import Action, ActionRow, EventRow, Status
 
 __all__ = [
+    "Action",
+    "ActionRow",
     "Agent",
     "AgentRole",
     "Config",
     "Event",
-    "EventLogRow",
     "EventNotFound",
     "EventQueue",
     "EventRow",
     "JobEvent",
-    "LogAction",
     "MessageEvent",
     "Priority",
     "ScheduledEvent",
