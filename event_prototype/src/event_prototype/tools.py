@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Coroutine, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any, Literal
+from typing import Any
 
 from anthropic import AsyncAnthropic
 from anthropic.types import Usage
@@ -22,14 +22,11 @@ from .agents import Agent
 from .config import Config
 from .contexts import Turn
 from .digest import summarize
-from .events import Priority
+from .events import Priority, PriorityName
 from .queue import Assignment, EventQueue
 from .render import PromptRenderer
 from .store import Action, EventRow
 from .subagent import report_of, run_subagent
-
-#: How the models name a priority level, since the stored value is an integer.
-type PriorityName = Literal["background", "low", "normal", "high", "realtime"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,7 +278,7 @@ def build_sweep_server(dispatcher: Dispatcher) -> MCPServer:
             priority: The priority it should carry from now on.
             reason: What makes it worth attention now, when it was not before.
         """
-        await dispatcher.escalate(event_id, Priority[priority.upper()], reason)
+        await dispatcher.escalate(event_id, Priority.from_name(priority), reason)
         return f"Event {event_id} escalated to {priority} and returned to triage."
 
     @server.tool(name="handle_event")

@@ -13,9 +13,14 @@ from __future__ import annotations
 from dataclasses import dataclass, fields
 from datetime import datetime
 from enum import IntEnum
-from typing import Any, ClassVar, Protocol, get_type_hints, runtime_checkable
+from typing import Any, ClassVar, Literal, Protocol, get_args, get_type_hints, runtime_checkable
 
 from .streams import StreamKind, StreamRef
+
+#: How a priority level is named where a person or a model writes one: the
+#: models' tool arguments and the config file. The stored value is an integer.
+type PriorityName = Literal["background", "low", "normal", "high", "realtime"]
+PRIORITY_NAMES: tuple[str, ...] = get_args(PriorityName.__value__)
 
 
 class Priority(IntEnum):
@@ -30,6 +35,13 @@ class Priority(IntEnum):
     NORMAL = 20
     HIGH = 30
     REALTIME = 40
+
+    @classmethod
+    def from_name(cls, name: str) -> Priority:
+        try:
+            return cls[name.upper()]
+        except KeyError:
+            raise ValueError(f"priority must be one of {PRIORITY_NAMES}, not {name!r}") from None
 
 
 @runtime_checkable

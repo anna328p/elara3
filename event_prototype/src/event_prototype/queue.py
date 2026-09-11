@@ -9,7 +9,8 @@ event's status and the reasoning behind it can never disagree.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import AsyncGenerator, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -41,6 +42,7 @@ from .store import (
     spawn_agent,
     utcnow,
 )
+from .wake import Arrival, Arrived, Notifier, Subscription
 
 #: An event's actions, oldest first, keyed by event id.
 type History = dict[int, list[ActionRow]]
@@ -94,6 +96,7 @@ class EventQueue:
     def __init__(self, engine: AsyncEngine, sessions: async_sessionmaker[AsyncSession]) -> None:
         self._engine = engine
         self._sessions = sessions
+        self._notifier = Notifier()
 
     @classmethod
     async def open(cls, db_path: Path | str) -> Self:
@@ -143,6 +146,7 @@ class EventQueue:
                 stream_id=await resolve_stream(session, ref) if ref else None,
             )
             session.add(row)
+        self._notifier.wake(Arrived(row.id, row.priority, Arrival.SUBMITTED, utcnow()))
         return row.id
 
     async def get(self, event_id: int) -> EventRow:
@@ -248,6 +252,7 @@ class EventQueue:
             row.status = Status.PENDING
             row.priority = priority
             self._append(session, [(event_id, reason)], Action.ESCALATE_EVENT, agent)
+        self._notifier.wake(Arrived(event_id, priority, Arrival.ESCALATED, utcnow()))
 
     async def set_digest(self, event_id: int, digest: str) -> None:
         """Cache the line that stands in for this event on the backlog list."""
@@ -386,6 +391,33 @@ class EventQueue:
         )
         async with self._sessions() as session:
             return list((await session.scalars(query)).all())
+
+    # -- waking ------------------------------------------------------------
+    #
+    # Wakes fire after the transaction block has exited, never inside it, so a
+    # write that rolls back wakes nobody. Only `submit` and `escalate` wake:
+    # they are the two ways an event enters the pending set.
+
+    @asynccontextmanager
+    async def subscribe(self, label: str) -> AsyncGenerator[Subscription]:
+        """Be woken whenever an event enters the pending set. Detaches on exit."""
+        subscription = self._notifier.add(label)
+        try:
+            yield subscription
+        finally:
+            self._notifier.remove(subscription)
+
+    def subscriptions(self) -> list[str]:
+        """Who is listening, by label."""
+        return self._notifier.labels()
+
+    async def pending_count(self) -> int:
+        """How many events triage would see. One query."""
+        query = select(func.count(EventRow.id)).where(
+            EventRow.status == Status.PENDING, EventRow.archived_at.is_(None)
+        )
+        async with self._sessions() as session:
+            return (await session.execute(query)).scalar_one()
 
     # -- internals ---------------------------------------------------------
 

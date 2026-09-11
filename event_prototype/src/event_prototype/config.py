@@ -7,6 +7,8 @@ from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any, Literal, get_args
 
+from .events import Priority
+
 DEFAULT_CONFIG_PATH = Path("config.toml")
 
 type Effort = Literal["low", "medium", "high", "max"]
@@ -23,6 +25,10 @@ class Config:
     db_path: Path = Path("events.db")
     subagent_effort: Effort = "medium"
     sweep_effort: Effort = "high"
+    #: `watch` runs triage on arrival for events at or above this; the rest
+    #: wait for the heartbeat.
+    urgent_priority: Priority = Priority.HIGH
+    heartbeat_seconds: float = 300.0
 
     @classmethod
     def load(cls, path: Path = DEFAULT_CONFIG_PATH) -> Config:
@@ -41,4 +47,11 @@ class Config:
                 raise ValueError(f"{key} must be one of {EFFORTS}, not {effort!r}")
         if "db_path" in raw:
             raw["db_path"] = Path(raw["db_path"])
+        if "urgent_priority" in raw:
+            raw["urgent_priority"] = Priority.from_name(raw["urgent_priority"])
+        if "heartbeat_seconds" in raw:
+            seconds = float(raw["heartbeat_seconds"])
+            if seconds <= 0:
+                raise ValueError(f"heartbeat_seconds must be positive, not {seconds!r}")
+            raw["heartbeat_seconds"] = seconds
         return cls(**raw)

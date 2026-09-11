@@ -1,4 +1,4 @@
-"""Command line for the prototype: seed the queue, look at it, triage it."""
+"""Command line for the prototype: seed the queue, look at it, triage it, watch it."""
 
 from __future__ import annotations
 
@@ -54,12 +54,19 @@ def main() -> None:
             help="print the prompt without calling the API",
         )
 
+    sub.add_parser("watch", help="triage on arrival and on the heartbeat, until ^C")
+
     args = parser.parse_args()
     config = Config.load(args.config)
     # The MCP server turns on INFO logging, which makes httpx narrate every
     # request over the report we are trying to print.
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    asyncio.run(_dispatch(args, config))
+    try:
+        asyncio.run(_dispatch(args, config))
+    except KeyboardInterrupt:
+        # ^C cancels the main task and everything unwinds before this is
+        # re-raised; nothing inside catches CancelledError.
+        print("\nStopped.")
 
 
 async def _dispatch(args: argparse.Namespace, config: Config) -> None:
@@ -74,6 +81,8 @@ async def _dispatch(args: argparse.Namespace, config: Config) -> None:
             await _context(config, args.stream_id)
         case "triage" | "sweep" as which:
             await _pass(config, which, dry_run=args.dry_run)
+        case "watch":
+            await _watch(config)
         case unknown:  # argparse rejects anything else first
             raise AssertionError(f"unhandled command: {unknown}")
 
@@ -201,6 +210,39 @@ async def _pass(config: Config, which: str, *, dry_run: bool) -> None:
         print(empty)
         return
     _report(result)
+
+
+async def _watch(config: Config) -> None:
+    """Run triage whenever something urgent arrives, and on every heartbeat."""
+    renderer = PromptRenderer()
+
+    # Imported here for the same reason as in `_pass`.
+    from anthropic import AsyncAnthropic
+    from dotenv import find_dotenv, load_dotenv
+
+    from .scheduler import watch
+    from .triage import run_triage
+
+    load_dotenv(find_dotenv(usecwd=True))
+
+    async with await EventQueue.open(config.db_path) as queue, AsyncAnthropic() as client:
+
+        async def on_due() -> None:
+            result = await run_triage(client, config, queue, renderer)
+            if result.considered:
+                _report(result)
+
+        print(
+            f"Watching {config.db_path}: triage on arrival at or above "
+            f"{config.urgent_priority.name.lower()}, otherwise every "
+            f"{config.heartbeat_seconds:g}s. ^C to stop."
+        )
+        await watch(
+            queue,
+            urgent=config.urgent_priority,
+            heartbeat_seconds=config.heartbeat_seconds,
+            on_due=on_due,
+        )
 
 
 def _plural(count: int, noun: str) -> str:

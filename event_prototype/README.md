@@ -18,6 +18,7 @@ uv run python -m event_prototype triage --dry-run   # the prompt, no API call
 uv run python -m event_prototype triage             # the real thing
 uv run python -m event_prototype sweep              # reconsider the backlog
 uv run python -m event_prototype context 1      # the conversation stream 1 routes to
+uv run python -m event_prototype watch          # triage on arrival and on the heartbeat, until ^C
 ```
 
 The live passes need `ANTHROPIC_API_KEY`, read from the `.env` at the repo root.
@@ -147,6 +148,35 @@ decision to make with numbers. Assignments that cross streams without sharing
 a context, or belong to none, still go to a one-shot subagent with a single-turn
 conversation and ask for no caching, since nothing will read it back.
 
+## Waking up
+
+A pass is a decision about what is pending, so something has to decide when to
+make one. `watch` does: it runs triage the moment an event at or above
+`urgent_priority` arrives, and otherwise every `heartbeat_seconds`, until ^C.
+
+Underneath is a subscription on the queue, `EventQueue.subscribe(label)`. A
+subscription is a wake-up and nothing more: no filter, and no copy of the event.
+The store is the truth and every consumer's read is idempotent, so all the queue
+has to say is that the pending set grew, and the consumer reads whatever it
+needs. What a wake does carry is why it fired. It is one of two records:
+`Arrived`, with the event's id, its priority and whether it was submitted or
+escalated back from the backlog; and `Heartbeat`, which is what a subscriber
+gets when the time it asked to wait for ran out. The scheduler decides from that
+alone. Its one read is a count of pending events, made before it runs a pass so
+that an idle heartbeat does not mint a triage agent for nothing.
+
+Only `submit` and `escalate` wake, because those are the two ways an event
+enters the pending set, and each does so after its transaction has committed, so
+a write that rolls back wakes nobody. Wakes coalesce: everything that arrived
+since the subscriber last looked comes back as one list, so a burst of messages
+is one pass, and an arrival that lands while a pass is running is waiting when
+the pass ends. The heartbeat is timed from the last pass rather than the last
+wake, so a trickle of low-priority arrivals cannot postpone it.
+
+The label is free text naming the subscriber and what it does with the wake, in
+the spirit of the reason every action carries; `subscriptions()` lists them, and
+nothing evaluates one.
+
 ## Shape of the code
 
 | module | what it holds |
@@ -162,6 +192,8 @@ conversation and ask for no caching, since nothing will read it back.
 | `runner.py` | driving one model pass against one tool set |
 | `triage.py` / `sweep.py` | the two passes, tying the above together |
 | `subagent.py` | the model call that handles assigned events |
+| `wake.py` | a subscription: the two records a wake can be, and the notifier the queue owns |
+| `scheduler.py` | `watch`: when a triage pass should happen |
 | `digest.py` | the model call that writes an event's backlog line |
 
 Nothing here holds global state: the queue owns its engine, the tools close over
@@ -210,7 +242,9 @@ Subagents are a single model call with no tools, so they describe how they would
 handle an event rather than doing it; the transcript can hold a tool loop, but
 nothing runs one. Contexts only grow: there is no collapse or compaction, and no
 message from one context to another, so a cross-stream assignment still goes to
-a subagent that remembers nothing. There is no heartbeat, so the sweep is a
-command you run rather than something that fires on idle time or a backlog
-threshold, and nothing yet decides when a pass should happen. No token budgets,
-and no subagent-of-a-subagent — those come with the real framework.
+a subagent that remembers nothing. `watch` decides when triage happens, but
+the sweep is still a command you run rather than something that fires on idle
+time or a backlog threshold. The queue wakes only subscribers in its own
+process, so an event written from another terminal waits for the heartbeat. No
+token budgets, and no subagent-of-a-subagent — those come with the real
+framework.

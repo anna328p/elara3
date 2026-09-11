@@ -11,3 +11,8 @@ db_path = "events.db"
 # the irreversible ones, so it gets more than the work it hands out.
 subagent_effort = "medium"
 sweep_effort = "high"
+
+# `watch` runs triage on arrival for events at or above this priority; everything
+# else waits for the heartbeat.
+urgent_priority = "high"
+heartbeat_seconds = 300
