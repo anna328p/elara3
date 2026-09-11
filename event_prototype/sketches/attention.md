@@ -110,8 +110,10 @@ unavoidable.
 
 The thread is a loop over the live context, in `attention.py`. Each turn of it:
 
-1. Read the focus. If it has moved or gone, finish with the old context
-   (below) and start on the new one, or wait.
+1. Wait on its subscription. A `Shifted` wake means the focus has moved or
+   gone: finish with the old context (below) and start on the new one. An
+   `Arrived` wake with nothing live is nothing to do, and the loop waits again
+   without a read.
 2. Claim every pending event whose stream routes to the live context:
    `ASSIGNED`, with an `ATTEND` action attributed to the attention agent and
    the context's conversational agent as assignee. Everything pending is taken
@@ -126,8 +128,10 @@ The thread is a loop over the live context, in `attention.py`. Each turn of it:
    Append the reply, complete the events with the reply as their report, and if
    the tool was called, append its result and record a `RELEASE` shift
    attributed to that agent.
-5. If nothing was pending, sleep `attention_poll_seconds` and go round
-   again.
+5. Go round again. Nothing here polls: the thread is woken by the queue after
+   each commit that could concern it, and its reads are idempotent, so a wake
+   that turns out to be someone else's arrival costs one query and nothing
+   else.
 
 Finishing with a context returns anything the thread claimed but never
 completed to `PENDING` with a `RETURNED` action, so a crash mid-call strands
@@ -148,19 +152,36 @@ The attention agent decides where the thread is. It is a separate agent role,
 except a yield is attributed to it. It is small (Haiku-class by default,
 `attention_model`) because it is shown very little.
 
-It wakes on conditions the loop checks alongside the thread, each once per
-change rather than continuously:
+It is a subscriber on the queue like `watch`, and decides from the wake's own
+metadata what to do. An `Arrived` at `HIGH` or above is worth a look: with
+nothing live it is an offer, with something live it is contention, and either
+way the agent reads its view and makes one call. An `Arrived` below that is
+ignored. A `Heartbeat` is the idle case: the control plane waits with a
+timeout of `focus_idle_seconds`, measured from the live context's last event,
+and when the wait runs out with nothing pending there and no reply owed it
+releases by reflex, with no call, since the thread's `yield_focus` is where
+judgment about a conversation's end lives. A `Shifted` from the thread's yield
+is a reason to look at whatever else is waiting.
 
-| wake | condition |
-| --- | --- |
-| offer | nothing is live and a message event at `HIGH` or above is pending in a channel or direct stream |
-| contention | something is live and such an event is pending in a stream that does not route there |
-| idle | the live context has had no event for `focus_idle_seconds` |
-| yield | the thread released focus, so whatever else is waiting can be considered |
+`Shifted` is the third kind of wake, next to `Arrived` and `Heartbeat`:
 
-A decision records the highest event id it saw, and the offer and contention
-wakes fire again only for events beyond it, so a `hold` is honoured until
-something new arrives. The idle wake fires once per quiet period.
+```python
+@dataclass(frozen=True, slots=True)
+class Shifted:
+    """The focus moved. The thread and the control plane both want to know."""
+
+    shift: Shift
+    context_id: int | None
+    at: datetime
+
+type Wake = Arrived | Heartbeat | Shifted
+```
+
+`EventQueue.shift()` wakes with it after its commit, the same way `submit`
+wakes with `Arrived`. `watch` ignores it, since `due` only cares about arrivals
+and heartbeats. Because a wake arrives once per commit, a `hold` is honoured
+until the next arrival by construction; nothing has to remember what was
+already considered.
 
 What it sees is `attention.md.j2`: the live context, if any, as its streams'
 titles, how long it has been live, events attended, seconds since the last one,
@@ -202,20 +223,81 @@ only place they meet is the refusal in `assign`.
 realtime_model = "claude-sonnet-5"
 realtime_effort = "low"
 attention_model = "claude-haiku-4-5"
-attention_poll_seconds = 0.5
 focus_idle_seconds = 180
 ```
 
 ## Commands
 
 ```sh
-uv run python -m event_prototype attend          # run the thread and the control plane until ^C
-uv run python -m event_prototype focus           # the current focus and every shift so far
-uv run python -m event_prototype say --dm alice "you there?"   # submit a REALTIME message, from another terminal
+uv run python -m event_prototype attend                 # watch, the control plane and the thread, until ^C
+uv run python -m event_prototype attend --play evening  # the same, fed a scripted evening of events
+uv run python -m event_prototype focus                  # the current focus and every shift so far
 ```
 
-`attend` prints each shift as it happens and each of the thread's turns with
-its cache reads, so a preemption is visible as the cold read it is.
+`attend` runs `watch` and the two new subscribers in one process and prints
+each shift as it happens and each of the thread's turns with its cache reads,
+so a preemption is visible as the cold read it is. The queue wakes only its own
+process, so an event written from a second terminal would wait for the
+heartbeat; `--play` names a scenario in `fixtures.py`, a timed list of events
+submitted from inside the process while the loops run, which is how the flow
+below is driven by hand.
+
+## Execution flow
+
+One evening, as the process sees it. `attend` opens the queue, mints the
+attention agent, releases any focus a previous run left behind, and starts
+three subscribers: `watch`, which runs triage on an urgent arrival and on the
+heartbeat; the control plane; and the thread. The sweep stays a command.
+
+A nightly backup reports. Its `JobEvent` is committed at `LOW`, and the queue
+wakes all three with `Arrived`. The thread has nothing live and goes back to
+waiting without a read. The control plane sees a priority below `HIGH` and does
+the same. `watch` sees it is below `urgent_priority` and waits for its
+heartbeat, on which triage runs, assigns the report to the backup job's
+context, whose agent is a subagent, and that subagent reports.
+
+Alice sends a direct message, submitted at `REALTIME`. Three wakes again.
+`watch` starts a triage pass, since realtime is urgent. The control plane reads
+its view, nothing live and one candidate, a direct stream with one realtime
+event a second old, makes one small call, and gets `focus`; `resolve_context`
+opens a context with a conversational agent, the `ACQUIRE` row commits, and
+the queue wakes everyone with `Shifted`. The thread reads the focus, claims
+Alice's message with an `ATTEND`, appends the event turn and the live brief,
+calls the conversational agent at low effort with `yield_focus` on offer,
+appends the reply, and completes the event with the reply as its report. The
+triage pass, running the while, either read the queue before the acquire and
+is refused when it calls `handle_one_event`, an error it reads and moves past,
+or reached `assign` first, in which case the thread found the event `ASSIGNED`
+and waited for the report before making its own first call. Either way the
+context has one writer.
+
+Alice sends two more while that call is in flight. Each commit wakes the
+thread; its next wait hands back both wakes as one list; it claims both, and
+`to_api` folds them into one user message. One call, reading the prefix the
+last one wrote.
+
+Bob mentions the character in a room, at `HIGH`. The control plane reads: the
+live context has taken four events, the last twenty seconds ago, no reply
+owed; the candidate is a channel stream with one high event and its
+description. The call returns `hold`, with a reason, and a `HOLD` row is
+written; nothing shifts. The thread was woken too, finds nothing pending in
+its context, and waits. `watch` runs triage, which sees Bob's event, sees the
+`<live>` block naming Alice, and hands the event to the room's context, opened
+now with a conversational agent of its own, briefed that the character is
+talking to Alice at the moment. Bob's reply comes in a minute rather than
+seconds, in the same voice, from an agent that will remember it next time.
+
+Alice writes goodnight. The thread replies and calls `yield_focus`; the tool
+result is appended, a `RELEASE` attributed to the conversational agent
+commits, `Shifted` goes out, and the thread finishes with the context, finding
+nothing to return. Had she just stopped writing, the control plane's wait would
+have run out at `focus_idle_seconds` and released by reflex instead. Either way
+the context is now cold, and a message from Alice an hour later goes through
+the same acquire, with the thread's first call a cold read of the whole
+transcript, which the report prints as such.
+
+Ctrl-C cancels the main task. The thread's `finally` releases and returns any
+claim it never completed; `watch` unwinds as its own documentation says.
 
 ## Verification
 
@@ -224,9 +306,13 @@ absent from `triage_view`; `assign` into the live context raises; a `PREEMPT`
 returns the old context's unfinished claims to `PENDING` and leaves its
 completed ones alone; a release with everything completed returns nothing;
 `focus` on a job stream is refused because its agent is a subagent; `pull` of a
-stream with its own context is refused; the offer wake fires once for one event
-and again only for a newer one; a stale focus is released on startup. The
-thread's model call is faked the way `test_dispatch` fakes subagents.
+stream with its own context is refused; `shift` wakes subscribers with
+`Shifted` after commit and not on rollback; an `Arrived` below `HIGH` makes the
+control plane read nothing; the idle heartbeat releases only with nothing
+pending and no reply owed; a stale focus is released on startup. The thread's
+and the control plane's model calls are faked the way `test_dispatch` fakes
+subagents, and the evening above is a test that drives the three loops with
+the fixture scenario and asserts the shift history it leaves.
 
 ## Left out
 
