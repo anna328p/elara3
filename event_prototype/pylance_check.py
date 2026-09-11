@@ -19,6 +19,11 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Any, cast
+
+# JSON-RPC messages and LSP diagnostics are untyped JSON; `Any` is honest here.
+Message = dict[str, Any]
+Diagnostics = dict[str, list[dict[str, Any]]]
 
 # pylance and node live at hashed store paths that move on every rebuild, so
 # they are discovered rather than hardcoded.  editor.nix puts pylance on PATH
@@ -37,7 +42,7 @@ def find_pylance() -> str:
             "secrets/pylance.nix is present so editor.nix builds it"
         )
 
-    def rank(path: Path):
+    def rank(path: Path) -> tuple[tuple[int, ...], float]:
         version = path.parent.parent.name.rsplit("-pylance-", 1)[-1]
         parts = tuple(int(p) if p.isdigit() else -1 for p in version.split("."))
         return (parts, path.stat().st_mtime)
@@ -79,7 +84,7 @@ SEVERITY = {1: "error", 2: "warning", 3: "info", 4: "hint"}
 
 def python_settings(
     type_checking_mode: str, diagnostic_mode: str, python_path: str
-) -> dict:
+) -> dict[str, Any]:
     return {
         "python": {
             "pythonPath": python_path,
@@ -105,26 +110,33 @@ class Server:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
+        # Popen types its pipes as Optional; they are all PIPE above.
+        assert self.proc.stdin is not None
+        assert self.proc.stdout is not None
+        assert self.proc.stderr is not None
+        self.stdin = self.proc.stdin
+        self.stdout = self.proc.stdout
+        self.stderr = self.proc.stderr
         self.buf = b""
         self.next_id = 0
         self.sel = selectors.DefaultSelector()
-        self.sel.register(self.proc.stdout, selectors.EVENT_READ)
+        self.sel.register(self.stdout, selectors.EVENT_READ)
         threading.Thread(target=self._drain_stderr, daemon=True).start()
 
     def _drain_stderr(self) -> None:
-        for line in self.proc.stderr:
+        for line in self.stderr:
             if self.debug:
                 sys.stderr.write("[pylance] " + line.decode(errors="replace"))
 
-    def send(self, msg: dict) -> None:
+    def send(self, msg: Message) -> None:
         body = json.dumps(msg).encode()
-        self.proc.stdin.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
-        self.proc.stdin.flush()
+        self.stdin.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+        self.stdin.flush()
 
-    def notify(self, method: str, params: dict) -> None:
+    def notify(self, method: str, params: Message) -> None:
         self.send({"jsonrpc": "2.0", "method": method, "params": params})
 
-    def request(self, method: str, params: dict) -> int:
+    def request(self, method: str, params: Message) -> int:
         self.next_id += 1
         self.send(
             {
@@ -136,10 +148,10 @@ class Server:
         )
         return self.next_id
 
-    def reply(self, req_id, result) -> None:
+    def reply(self, req_id: int | str, result: object) -> None:
         self.send({"jsonrpc": "2.0", "id": req_id, "result": result})
 
-    def read(self, timeout: float) -> dict | None:
+    def read(self, timeout: float) -> Message | None:
         """Next message, or None if nothing arrived within `timeout`."""
         deadline = time.monotonic() + timeout
         while True:
@@ -151,12 +163,12 @@ class Server:
                 return None
             if not self.sel.select(remaining):
                 continue
-            chunk = os.read(self.proc.stdout.fileno(), 65536)
+            chunk = os.read(self.stdout.fileno(), 65536)
             if not chunk:
                 raise RuntimeError("pylance exited unexpectedly")
             self.buf += chunk
 
-    def _take(self) -> dict | None:
+    def _take(self) -> Message | None:
         head, sep, rest = self.buf.partition(b"\r\n\r\n")
         if not sep:
             return None
@@ -187,11 +199,11 @@ def check(
     python_path: str,
     timeout: float,
     debug: bool,
-) -> dict[str, list[dict]]:
+) -> Diagnostics:
     settings = python_settings(type_checking_mode, diagnostic_mode, python_path)
     server = Server([find_pylance()], cwd=str(root), debug=debug)
     wanted = {f.as_uri() for f in files}
-    diagnostics: dict[str, list[dict]] = {}
+    diagnostics: Diagnostics = {}
 
     try:
         init_id = server.request(
@@ -224,15 +236,17 @@ def check(
 
         changed_at = time.monotonic()
 
-        def lookup(section: str):
-            value = settings
+        def lookup(section: str) -> Any:
+            value: Any = settings
             for part in section.split("."):
                 if not part:
                     continue
-                value = value.get(part, {}) if isinstance(value, dict) else {}
+                if not isinstance(value, dict):
+                    return {}
+                value = cast(dict[str, Any], value).get(part, {})
             return value
 
-        def handle(msg: dict) -> None:
+        def handle(msg: Message) -> None:
             """Record diagnostics and answer whatever the server asks of us."""
             nonlocal changed_at
             method = msg.get("method")
@@ -252,7 +266,7 @@ def check(
                 else:
                     server.reply(msg["id"], None)
 
-        def pump(deadline: float, until_id: int | None = None):
+        def pump(deadline: float, until_id: int | None = None) -> Message | None:
             """Handle traffic until `until_id` is answered or time runs out."""
             while True:
                 remaining = deadline - time.monotonic()
@@ -307,7 +321,7 @@ def check(
         server.shutdown()
 
 
-def report(diagnostics: dict[str, list[dict]], root: Path) -> int:
+def report(diagnostics: Diagnostics, root: Path) -> int:
     counts: dict[str, int] = {}
     for uri in sorted(diagnostics):
         path = Path(uri.removeprefix("file://"))
