@@ -213,7 +213,7 @@ async def _pass(config: Config, which: str, *, dry_run: bool) -> None:
 
 
 async def _watch(config: Config) -> None:
-    """Run triage whenever something urgent arrives, and on every heartbeat."""
+    """Run triage whenever an immediate arrival lands, and on every heartbeat."""
     renderer = PromptRenderer()
 
     # Imported here for the same reason as in `_pass`.
@@ -233,13 +233,11 @@ async def _watch(config: Config) -> None:
                 _report(result)
 
         print(
-            f"Watching {config.db_path}: triage on arrival at or above "
-            f"{config.urgent_priority.name.lower()}, otherwise every "
-            f"{config.heartbeat_seconds:g}s. ^C to stop."
+            f"Watching {config.db_path}: triage on a nudge or an active arrival, "
+            f"otherwise every {config.heartbeat_seconds:g}s. ^C to stop."
         )
         await watch(
             queue,
-            urgent=config.urgent_priority,
             heartbeat_seconds=config.heartbeat_seconds,
             on_due=on_due,
         )

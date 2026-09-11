@@ -39,9 +39,13 @@ Assign every event above exactly one disposition, using these tools:
 
 Guidance:
 
-- Realtime and high-priority events are waiting on a person. Handle them.
-- Background and low-priority events are usually deferrable unless they have
-  become stale enough to matter, or they unblock something urgent.
+- The priority says how the event arrived, not how much it matters. An
+  `active` event is someone in a live exchange, and a `nudge` is something
+  that was not to wait for your next heartbeat: handle both. An `async` event
+  belongs to its stream's conversation and is for that conversation's agent to
+  take up at its own pace, so hand it there. A `background` event is usually
+  deferrable unless it has become stale enough to matter, or it unblocks
+  something that is not.
 - Group only what genuinely belongs together. Two unrelated messages from the
   same person are still two events.
 - A `stream` is where an event happened — a room, a correspondent, a recurring

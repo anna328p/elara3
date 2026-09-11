@@ -7,7 +7,7 @@ from datetime import timedelta
 import pytest
 
 from event_prototype.agents import Agent, AgentRole
-from event_prototype.events import JobEvent, Priority, ScheduledEvent
+from event_prototype.events import JobEvent, Priority, PriorityMismatch, ScheduledEvent
 from event_prototype.queue import EventNotFound, EventQueue
 from event_prototype.store import Action, Status, utcnow
 
@@ -23,9 +23,9 @@ async def test_submit_round_trips_a_typed_event(queue: EventQueue) -> None:
         note="post the devlog",
     )
 
-    row = await queue.get(await queue.submit(event, Priority.HIGH))
+    row = await queue.get(await queue.submit(event, Priority.NUDGE))
 
-    assert row.priority is Priority.HIGH
+    assert row.priority is Priority.NUDGE
     assert row.status is Status.PENDING
     restored = row.to_event()
     assert isinstance(restored, ScheduledEvent)
@@ -36,10 +36,10 @@ async def test_submit_round_trips_a_typed_event(queue: EventQueue) -> None:
 
 async def test_listing_is_ordered_by_urgency_then_age(queue: EventQueue) -> None:
     now = utcnow()
-    low = await queue.submit(message("low"), Priority.LOW)
-    newer_high = await queue.submit(message("newer", timestamp=now), Priority.HIGH)
+    low = await queue.submit(message("low"), Priority.BACKGROUND)
+    newer_high = await queue.submit(message("newer", timestamp=now), Priority.NUDGE)
     older_high = await queue.submit(
-        message("older", timestamp=now - timedelta(hours=1)), Priority.HIGH
+        message("older", timestamp=now - timedelta(hours=1)), Priority.NUDGE
     )
 
     ordered = [row.id for row in await queue.list_events()]
@@ -48,19 +48,19 @@ async def test_listing_is_ordered_by_urgency_then_age(queue: EventQueue) -> None
 
 
 async def test_edit_changes_only_what_was_passed(queue: EventQueue) -> None:
-    event_id = await queue.submit(message(), Priority.LOW)
+    event_id = await queue.submit(message(), Priority.BACKGROUND)
 
-    await queue.edit(event_id, priority=Priority.REALTIME)
+    await queue.edit(event_id, priority=Priority.ACTIVE)
     row = await queue.get(event_id)
 
-    assert row.priority is Priority.REALTIME
+    assert row.priority is Priority.ACTIVE
     assert row.description == "a message"
 
 
 async def test_completed_events_leave_the_active_list_but_keep_their_report(
     queue: EventQueue,
 ) -> None:
-    event_id = await queue.submit(message(), Priority.NORMAL)
+    event_id = await queue.submit(message(), Priority.BACKGROUND)
     subagent = await queue.spawn(AgentRole.SUBAGENT)
 
     await queue.complete([event_id], agent=subagent, report="replied in #workshop")
@@ -89,7 +89,7 @@ async def test_deferred_events_stay_active_for_the_next_pass(
 async def test_archiving_retires_an_event_without_deleting_it(
     queue: EventQueue, triage: Agent
 ) -> None:
-    event_id = await queue.submit(message(), Priority.NORMAL)
+    event_id = await queue.submit(message(), Priority.BACKGROUND)
 
     await queue.archive(event_id, agent=triage, reason="no longer relevant")
 
@@ -104,17 +104,73 @@ async def test_archiving_retires_an_event_without_deleting_it(
     assert history[0].archived_at is not None
 
 
-async def test_min_priority_filters_the_queue(queue: EventQueue) -> None:
-    await queue.submit(message("background"), Priority.BACKGROUND)
-    urgent = await queue.submit(message("urgent"), Priority.REALTIME)
+def test_a_priority_is_two_facts() -> None:
+    assert not Priority.BACKGROUND.to_context and not Priority.BACKGROUND.immediate
+    assert not Priority.NUDGE.to_context and Priority.NUDGE.immediate
+    assert Priority.ASYNC.to_context and not Priority.ASYNC.immediate
+    assert Priority.ACTIVE.to_context and Priority.ACTIVE.immediate
 
-    rows = await queue.list_events(min_priority=Priority.HIGH)
 
-    assert [row.id for row in rows] == [urgent]
+def test_the_listing_puts_the_woken_first_and_a_person_before_a_job() -> None:
+    assert sorted(Priority, reverse=True) == [
+        Priority.ACTIVE,
+        Priority.NUDGE,
+        Priority.ASYNC,
+        Priority.BACKGROUND,
+    ]
+
+
+async def test_a_context_bound_priority_needs_a_stream(queue: EventQueue) -> None:
+    alarm = ScheduledEvent(
+        timestamp=utcnow(), description="one-off", fires_at=utcnow(), note="once"
+    )
+    for priority in (Priority.ASYNC, Priority.ACTIVE):
+        with pytest.raises(PriorityMismatch, match="has no stream"):
+            await queue.submit(alarm, priority)
+    assert await queue.list_events() == []
+
+    # The triage-bound ones are fine without.
+    await queue.submit(alarm, Priority.NUDGE)
+
+
+async def test_active_needs_a_conversation(queue: EventQueue) -> None:
+    report = JobEvent(
+        timestamp=utcnow(),
+        description="backup",
+        job_id="b1",
+        outcome="ok",
+        summary="done",
+        job="backup",
+    )
+    with pytest.raises(PriorityMismatch, match="job stream"):
+        await queue.submit(report, Priority.ACTIVE)
+
+    # Async is allowed: the job's context takes the report at its own pace.
+    await queue.submit(report, Priority.ASYNC)
+    await queue.submit(message(direct=True), Priority.ACTIVE)
+
+
+async def test_edit_and_escalate_refuse_a_priority_the_event_cannot_carry(
+    queue: EventQueue, triage: Agent
+) -> None:
+    alarm = ScheduledEvent(
+        timestamp=utcnow(), description="one-off", fires_at=utcnow(), note="once"
+    )
+    event_id = await queue.submit(alarm, Priority.BACKGROUND)
+
+    with pytest.raises(PriorityMismatch):
+        await queue.edit(event_id, priority=Priority.ASYNC)
+    await queue.defer([(event_id, "later")], agent=triage)
+    with pytest.raises(PriorityMismatch):
+        await queue.escalate(event_id, agent=triage, priority=Priority.ACTIVE, reason="now")
+
+    row = await queue.get(event_id)
+    assert row.priority is Priority.BACKGROUND
+    assert row.status is Status.DEFERRED
 
 
 async def test_get_many_preserves_the_requested_order(queue: EventQueue) -> None:
-    first = await queue.submit(message("one"), Priority.LOW)
+    first = await queue.submit(message("one"), Priority.BACKGROUND)
     second = await queue.submit(
         JobEvent(
             timestamp=utcnow(),
@@ -123,7 +179,7 @@ async def test_get_many_preserves_the_requested_order(queue: EventQueue) -> None
             outcome="succeeded",
             summary="240 frames",
         ),
-        Priority.NORMAL,
+        Priority.BACKGROUND,
     )
 
     rows = await queue.get_many([second, first])
@@ -136,7 +192,7 @@ async def test_get_many_preserves_the_requested_order(queue: EventQueue) -> None
 async def test_a_disposition_over_several_events_is_one_transaction(
     queue: EventQueue, triage: Agent
 ) -> None:
-    ids = [await queue.submit(message(f"m{i}"), Priority.LOW) for i in range(3)]
+    ids = [await queue.submit(message(f"m{i}"), Priority.BACKGROUND) for i in range(3)]
 
     # A bad id in the batch means nothing is written, not a partial write.
     with pytest.raises(EventNotFound):

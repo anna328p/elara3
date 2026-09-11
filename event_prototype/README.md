@@ -1,8 +1,8 @@
 # event_prototype
 
 A working sketch of the elara3 event queue (see `../architecture.md`, §"The event
-queue"): events accumulate in a priority queue, a triage model sorts them, and
-each piece of work goes to a subagent.
+queue"): events accumulate in a queue, a triage model sorts them, and each piece
+of work goes to a subagent.
 
 ## Running it
 
@@ -54,7 +54,7 @@ it, and a failure just leaves the previous line standing.
 nobody waiting, sees the backlog in full with each event's complete history, and
 has the dispositions that triage should not be making in a hurry:
 
-- `escalate_event` — this does need doing; set its real priority and return it to triage
+- `escalate_event` — this does need doing; set the priority it should have had and return it to the pending set
 - `handle_event` — needs work now, and is self-contained enough to dispatch directly
 - `archive_event` — this will never need action
 - `keep_deferred` — still not worth acting on, with a fresh account of why
@@ -148,11 +148,46 @@ decision to make with numbers. Assignments that cross streams without sharing
 a context, or belong to none, still go to a one-shot subagent with a single-turn
 conversation and ask for no caching, since nothing will read it back.
 
+## Priorities
+
+An event's priority is not a rank. It is two facts about how the event is
+delivered, chosen by whoever submits it: where it goes, and whether anyone is
+woken for it.
+
+| | handled at a heartbeat | handled now |
+| --- | --- | --- |
+| goes to triage | `background` | `nudge` |
+| goes to the stream's context | `async` | `active` |
+
+Background waits for triage's next heartbeat. A nudge wakes triage, the way a
+phone's notification sound makes you look without saying you must answer; triage
+defers nudges as readily as anything else. Async lands in the context of the
+event's stream and waits for that context's own heartbeat, which is where room
+chatter, newsletters and unhurried questions belong. Active lands there too and
+also wakes attention, because someone is in a live exchange and a reply in
+seconds is the difference. `Priority` exposes the two facts as `to_context` and
+`immediate`, and every consumer reads those rather than comparing numbers; the
+integer only orders a mixed listing.
+
+Two constraints follow. Async and active need a stream, since the context is the
+stream's, so a one-off alarm or a lone job run can only be background or a
+nudge. Active further needs a conversation, a channel or a direct stream, since
+attention is a presence with a person and a job has nobody waiting in it. A
+priority the event cannot carry is refused at `submit`, `edit` and `escalate`
+alike, because the submitter chose the route and should hear that it does not
+exist.
+
+Contexts do not yet have heartbeats of their own, so for now async and active
+events pass through triage like the rest and are assigned into their stream's
+context from there; the prompt tells triage which are which. When contexts wake
+on their own, `due` narrows to the triage-bound priorities and nothing else
+changes.
+
 ## Waking up
 
 A pass is a decision about what is pending, so something has to decide when to
-make one. `watch` does: it runs triage the moment an event at or above
-`urgent_priority` arrives, and otherwise every `heartbeat_seconds`, until ^C.
+make one. `watch` does: it runs triage the moment an immediate event arrives, a
+nudge or an active one, and otherwise every `heartbeat_seconds`, until ^C.
 
 Underneath is a subscription on the queue, `EventQueue.subscribe(label)`. A
 subscription is a wake-up and nothing more: no filter, and no copy of the event.
@@ -171,7 +206,7 @@ a write that rolls back wakes nobody. Wakes coalesce: everything that arrived
 since the subscriber last looked comes back as one list, so a burst of messages
 is one pass, and an arrival that lands while a pass is running is waiting when
 the pass ends. The heartbeat is timed from the last pass rather than the last
-wake, so a trickle of low-priority arrivals cannot postpone it.
+wake, so a trickle of heartbeat-bound arrivals cannot postpone it.
 
 The label is free text naming the subscriber and what it does with the wake, in
 the spirit of the reason every action carries; `subscriptions()` lists them, and

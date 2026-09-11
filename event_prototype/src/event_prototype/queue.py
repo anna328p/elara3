@@ -22,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from .agents import Agent, AgentRole
 from .contexts import Turn
-from .events import Event, Priority
+from .events import Event, Priority, check_priority
 from .store import (
     Action,
     ActionRow,
@@ -123,8 +123,13 @@ class EventQueue:
         async with self._sessions.begin() as session:
             return (await spawn_agent(session, role)).to_agent()
 
-    async def submit(self, event: Event, priority: Priority = Priority.NORMAL) -> int:
+    async def submit(self, event: Event, priority: Priority = Priority.BACKGROUND) -> int:
         """Queue an event; returns the id used to refer to it from here on.
+
+        The priority is the submitter's routing decision (see `Priority`), and
+        one the event's stream cannot carry is refused before anything is
+        written. The default is the one that commits to nothing: triage, at
+        its next heartbeat.
 
         If the event names a stream, it is opened on first sight and joined
         thereafter, in the same transaction as the event itself — so an event
@@ -134,8 +139,9 @@ class EventQueue:
         added has no loaded `stream`, and reaching for one after the session
         closes raises. Callers that want the stream go through `get`.
         """
+        ref = event.stream
+        check_priority(priority, ref.kind if ref else None)
         async with self._sessions.begin() as session:
-            ref = event.stream
             row = EventRow(
                 kind=type(event).kind,
                 timestamp=event.timestamp,
@@ -173,6 +179,7 @@ class EventQueue:
             if description is not None:
                 row.description = description
             if priority is not None:
+                check_priority(priority, row.stream.kind if row.stream else None)
                 row.priority = priority
             if timestamp is not None:
                 row.timestamp = timestamp
@@ -246,9 +253,10 @@ class EventQueue:
     async def escalate(
         self, event_id: int, *, agent: Agent, priority: Priority, reason: str
     ) -> None:
-        """Return a deferred event to triage's working set, more urgent than before."""
+        """Return a deferred event to the pending set, at the priority it should have had."""
         async with self._sessions.begin() as session:
             (row,) = await self._require(session, [event_id])
+            check_priority(priority, row.stream.kind if row.stream else None)
             row.status = Status.PENDING
             row.priority = priority
             self._append(session, [(event_id, reason)], Action.ESCALATE_EVENT, agent)
@@ -277,17 +285,15 @@ class EventQueue:
 
     # -- reading -----------------------------------------------------------
 
-    async def list_events(
-        self, *, active_only: bool = True, min_priority: Priority | None = None
-    ) -> list[EventRow]:
-        """Most urgent first, oldest first within a priority.
+    async def list_events(self, *, active_only: bool = True) -> list[EventRow]:
+        """Ordered as `Priority` orders, oldest first within a priority.
 
         `active_only` is the working queue: nothing completed, nothing archived.
         Turn it off for the full history — archived rows included, since that is
         the only view that shows them (`get` refuses them either way).
         """
         async with self._sessions() as session:
-            query = self._events_query(active_only=active_only, min_priority=min_priority)
+            query = self._events_query(active_only=active_only)
             return list((await session.scalars(query)).all())
 
     async def triage_view(self) -> TriageView:
@@ -422,16 +428,12 @@ class EventQueue:
     # -- internals ---------------------------------------------------------
 
     @staticmethod
-    def _events_query(
-        *, active_only: bool = True, min_priority: Priority | None = None
-    ):
+    def _events_query(*, active_only: bool = True):
         query = select(EventRow)
         if active_only:
             query = query.where(
                 EventRow.archived_at.is_(None), EventRow.status != Status.COMPLETED
             )
-        if min_priority is not None:
-            query = query.where(EventRow.priority >= min_priority)
         return query.order_by(EventRow.priority.desc(), EventRow.timestamp.asc())
 
     @staticmethod

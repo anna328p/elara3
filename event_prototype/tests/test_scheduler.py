@@ -18,29 +18,30 @@ def arrived(priority: Priority) -> Arrived:
 
 
 def test_nothing_is_not_due() -> None:
-    assert not due([], urgent=Priority.HIGH)
+    assert not due([])
 
 
 def test_a_heartbeat_is_always_due() -> None:
-    assert due([Heartbeat(utcnow())], urgent=Priority.HIGH)
+    assert due([Heartbeat(utcnow())])
 
 
-def test_an_arrival_is_due_at_or_above_the_urgent_priority() -> None:
-    assert due([arrived(Priority.HIGH)], urgent=Priority.HIGH)
-    assert due([arrived(Priority.REALTIME)], urgent=Priority.HIGH)
-    assert not due([arrived(Priority.NORMAL)], urgent=Priority.HIGH)
+def test_an_immediate_arrival_is_due_and_a_heartbeat_bound_one_is_not() -> None:
+    assert due([arrived(Priority.NUDGE)])
+    assert due([arrived(Priority.ACTIVE)])
+    assert not due([arrived(Priority.BACKGROUND)])
+    assert not due([arrived(Priority.ASYNC)])
 
 
 def test_a_batch_is_due_if_any_wake_in_it_is() -> None:
-    quiet = [arrived(Priority.LOW), arrived(Priority.NORMAL)]
-    assert not due(quiet, urgent=Priority.HIGH)
-    assert due([*quiet, arrived(Priority.HIGH)], urgent=Priority.HIGH)
+    quiet = [arrived(Priority.BACKGROUND), arrived(Priority.ASYNC)]
+    assert not due(quiet)
+    assert due([*quiet, arrived(Priority.NUDGE)])
 
 
-async def test_an_urgent_arrival_runs_a_pass_without_waiting_for_the_heartbeat(
+async def test_a_nudge_runs_a_pass_without_waiting_for_the_heartbeat(
     queue: EventQueue,
 ) -> None:
-    await queue.submit(message("already here"), Priority.LOW)
+    await queue.submit(message("already here"), Priority.BACKGROUND)
     until = asyncio.Event()
     calls: list[int] = []
 
@@ -48,20 +49,18 @@ async def test_an_urgent_arrival_runs_a_pass_without_waiting_for_the_heartbeat(
         calls.append(len(calls) + 1)
         if len(calls) == 1:
             # Startup is a heartbeat; this arrival is what the second call is for.
-            await queue.submit(message("urgent"), Priority.HIGH)
+            await queue.submit(message("look now"), Priority.NUDGE)
         else:
             until.set()
 
     async with asyncio.timeout(5):
-        await watch(
-            queue, urgent=Priority.HIGH, heartbeat_seconds=3600, on_due=on_due, until=until
-        )
+        await watch(queue, heartbeat_seconds=3600, on_due=on_due, until=until)
 
     assert calls == [1, 2]
 
 
-async def test_a_quiet_arrival_waits_for_the_heartbeat(queue: EventQueue) -> None:
-    await queue.submit(message("already here"), Priority.LOW)
+async def test_a_background_arrival_waits_for_the_heartbeat(queue: EventQueue) -> None:
+    await queue.submit(message("already here"), Priority.BACKGROUND)
     loop = asyncio.get_running_loop()
     until = asyncio.Event()
     heartbeat = 0.05
@@ -70,14 +69,12 @@ async def test_a_quiet_arrival_waits_for_the_heartbeat(queue: EventQueue) -> Non
     async def on_due() -> None:
         called_at.append(loop.time())
         if len(called_at) == 1:
-            await queue.submit(message("can wait"), Priority.LOW)
+            await queue.submit(message("can wait"), Priority.BACKGROUND)
         else:
             until.set()
 
     async with asyncio.timeout(5):
-        await watch(
-            queue, urgent=Priority.HIGH, heartbeat_seconds=heartbeat, on_due=on_due, until=until
-        )
+        await watch(queue, heartbeat_seconds=heartbeat, on_due=on_due, until=until)
 
     first, second = called_at
     # The timer may fire a hair early by the loop's clock resolution, never by more.
@@ -93,7 +90,7 @@ async def test_an_idle_heartbeat_runs_nothing(queue: EventQueue) -> None:
         calls += 1
 
     watching = asyncio.create_task(
-        watch(queue, urgent=Priority.HIGH, heartbeat_seconds=0.01, on_due=on_due, until=until)
+        watch(queue, heartbeat_seconds=0.01, on_due=on_due, until=until)
     )
     await asyncio.sleep(0.05)  # several heartbeats with nothing pending
     until.set()

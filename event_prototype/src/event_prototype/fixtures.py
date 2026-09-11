@@ -2,7 +2,10 @@
 
 The set is deliberately mixed: things that clearly need answering now, things
 that clearly do not, a pair that belongs together, and a job result that changes
-how an earlier message should be answered.
+how an earlier message should be answered. Every priority appears at least once,
+placed the way an ingestion layer would place it: a person addressing the
+character is active, a room's chatter and an unhurried question are async, a
+job worth interrupting for is a nudge, and the rest is background.
 """
 
 from __future__ import annotations
@@ -35,13 +38,14 @@ def synthetic_events() -> list[tuple[BaseEvent, Priority]]:
                 conversation="#workshop",
                 body="wait, so did the render finish or did it choke on the alpha channel again?",
             ),
-            Priority.REALTIME,
+            Priority.ACTIVE,
         ),
         (
             JobEvent(
                 timestamp=ago(minutes=2),
                 description="Overnight render job finished",
-                # A one-off render, so it belongs to no stream.
+                # A one-off render, so it belongs to no stream, and so it can
+                # only be a nudge or background; a nudge, because Mira is asking.
                 job_id="render-0412",
                 outcome="succeeded",
                 summary=(
@@ -49,7 +53,7 @@ def synthetic_events() -> list[tuple[BaseEvent, Priority]]:
                     "two frames (117, 118) show banding in the gradient."
                 ),
             ),
-            Priority.NORMAL,
+            Priority.NUDGE,
         ),
         (
             ScheduledEvent(
@@ -59,7 +63,7 @@ def synthetic_events() -> list[tuple[BaseEvent, Priority]]:
                 note="Post the devlog before Friday evening. Draft is in workspace notes.",
                 schedule="weekly-devlog",
             ),
-            Priority.HIGH,
+            Priority.NUDGE,
         ),
         (
             MessageEvent(
@@ -74,7 +78,7 @@ def synthetic_events() -> list[tuple[BaseEvent, Priority]]:
                 ),
                 direct=True,
             ),
-            Priority.HIGH,
+            Priority.ACTIVE,
         ),
         (
             MessageEvent(
@@ -86,7 +90,7 @@ def synthetic_events() -> list[tuple[BaseEvent, Priority]]:
                 body="forgot to say: submissions are max 3 minutes, and they want a rough cut by the 20th.",
                 direct=True,
             ),
-            Priority.NORMAL,
+            Priority.ACTIVE,
         ),
         (
             # Same stream as Mira's question, and nothing to do with it: sharing
@@ -99,7 +103,7 @@ def synthetic_events() -> list[tuple[BaseEvent, Priority]]:
                 conversation="#workshop",
                 body="the new brush engine update broke my pressure curves btw",
             ),
-            Priority.LOW,
+            Priority.ASYNC,
         ),
         (
             ScheduledEvent(
@@ -120,7 +124,7 @@ def synthetic_events() -> list[tuple[BaseEvent, Priority]]:
                 summary="rsync exited 23 after 4.2GB — permission denied on /workspace/old/.cache",
                 job="backup",
             ),
-            Priority.LOW,
+            Priority.BACKGROUND,
         ),
         (
             # The same job failing the same way a day earlier. Two events on one
@@ -133,7 +137,7 @@ def synthetic_events() -> list[tuple[BaseEvent, Priority]]:
                 summary="rsync exited 23 after 4.2GB — permission denied on /workspace/old/.cache",
                 job="backup",
             ),
-            Priority.LOW,
+            Priority.BACKGROUND,
         ),
         (
             MessageEvent(
@@ -144,7 +148,7 @@ def synthetic_events() -> list[tuple[BaseEvent, Priority]]:
                 conversation="#general",
                 body="ha, elara's been doing this for months, ask them about the gradient thing",
             ),
-            Priority.LOW,
+            Priority.ASYNC,
         ),
         (
             MessageEvent(
@@ -156,7 +160,7 @@ def synthetic_events() -> list[tuple[BaseEvent, Priority]]:
                 body="do you still have the brush pack you were using in august? no rush",
                 direct=True,
             ),
-            Priority.NORMAL,
+            Priority.ASYNC,
         ),
         (
             MessageEvent(

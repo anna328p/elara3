@@ -267,11 +267,15 @@ def build_sweep_server(dispatcher: Dispatcher) -> MCPServer:
 
     @server.tool(name="escalate_event")
     async def _escalate_event(event_id: int, priority: PriorityName, reason: str) -> str:
-        """Return a deferred event to triage, at the priority it should have had.
+        """Return a deferred event to the pending set, at the priority it should have had.
 
         Use when the event does need doing but is not so self-contained that you
-        want to hand it straight to a subagent. It rejoins the working queue and
-        triage picks it up on the next pass.
+        want to hand it straight to a subagent. The priority says where it goes
+        from here: `nudge` wakes triage for it now, `background` leaves it for
+        triage's next heartbeat, and `async` or `active` send it to its stream's
+        conversation, at that conversation's pace or with attention on it. The
+        last two need a stream, and `active` a conversational one; a priority
+        the event cannot carry is refused.
 
         Args:
             event_id: The event to escalate.
@@ -279,7 +283,7 @@ def build_sweep_server(dispatcher: Dispatcher) -> MCPServer:
             reason: What makes it worth attention now, when it was not before.
         """
         await dispatcher.escalate(event_id, Priority.from_name(priority), reason)
-        return f"Event {event_id} escalated to {priority} and returned to triage."
+        return f"Event {event_id} escalated to {priority} and returned to the pending set."
 
     @server.tool(name="handle_event")
     async def _handle_event(event_id: int, instructions: str) -> str:

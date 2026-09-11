@@ -17,24 +17,49 @@ from typing import Any, ClassVar, Literal, Protocol, get_args, get_type_hints, r
 
 from .streams import StreamKind, StreamRef
 
-#: How a priority level is named where a person or a model writes one: the
-#: models' tool arguments and the config file. The stored value is an integer.
-type PriorityName = Literal["background", "low", "normal", "high", "realtime"]
+#: How a priority is named where a person or a model writes one: the models'
+#: tool arguments and the config file. The stored value is an integer.
+type PriorityName = Literal["background", "nudge", "async", "active"]
 PRIORITY_NAMES: tuple[str, ...] = get_args(PriorityName.__value__)
 
 
 class Priority(IntEnum):
-    """Ordering for the queue. Higher is more urgent.
+    """What happens to an event when it arrives: where it goes, and whether
+    anyone is woken for it.
 
-    Realtime events want a response now; background events wait for the next
-    idle moment. The gaps leave room to insert levels later without a migration.
+    Two facts, not a rank. Where: `BACKGROUND` and `NUDGE` go to triage;
+    `ASYNC` and `ACTIVE` go straight to the context of the event's stream, and
+    so need one. Whether: `BACKGROUND` and `ASYNC` wait for the next heartbeat
+    of wherever they landed; `NUDGE` wakes triage now, and `ACTIVE` also wakes
+    attention, since someone is in a live exchange and a reply in seconds is
+    the difference.
+
+    So a job report that can wait is background; one that should not is a
+    nudge; room chatter, a newsletter or an unhurried question in a direct
+    stream is async; and a direct message or a mention is active. A phone is
+    the model: a nudge is the notification sound, looked at when noticed and
+    as often set aside as answered.
+
+    The integer orders a mixed list for display, the woken before the
+    waiting, and a person's exchange before the rest. It is not urgency across
+    kinds: an async room message and a nudge from a job never compete for the
+    same reader, and nothing compares the numbers.
     """
 
     BACKGROUND = 0
-    LOW = 10
-    NORMAL = 20
-    HIGH = 30
-    REALTIME = 40
+    ASYNC = 1
+    NUDGE = 2
+    ACTIVE = 3
+
+    @property
+    def to_context(self) -> bool:
+        """Delivered to the stream's context rather than to triage."""
+        return self in (Priority.ASYNC, Priority.ACTIVE)
+
+    @property
+    def immediate(self) -> bool:
+        """Wakes its reader on arrival rather than waiting for a heartbeat."""
+        return self in (Priority.NUDGE, Priority.ACTIVE)
 
     @classmethod
     def from_name(cls, name: str) -> Priority:
@@ -42,6 +67,28 @@ class Priority(IntEnum):
             return cls[name.upper()]
         except KeyError:
             raise ValueError(f"priority must be one of {PRIORITY_NAMES}, not {name!r}") from None
+
+
+class PriorityMismatch(ValueError):
+    """The priority names a route the event cannot take."""
+
+
+def check_priority(priority: Priority, stream: StreamKind | None) -> None:
+    """Refuse a priority the event's stream cannot carry.
+
+    The context-bound priorities need a stream, because the context is the
+    stream's; a one-off alarm or a lone job run has nowhere to be delivered
+    but triage. `ACTIVE` further needs a conversation, since attention is a
+    presence in an exchange with a person and a job has no one waiting in it.
+    Refused at submit rather than routed around, because the submitter chose
+    the route and should hear that it does not exist.
+    """
+    if priority.to_context and stream is None:
+        raise PriorityMismatch(
+            f"{priority.name.lower()} delivers to a stream's context, and this event has no stream"
+        )
+    if priority is Priority.ACTIVE and stream is StreamKind.JOB:
+        raise PriorityMismatch("active is for a conversation, and a job stream is not one")
 
 
 @runtime_checkable

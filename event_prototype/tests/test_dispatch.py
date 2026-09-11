@@ -29,7 +29,7 @@ async def dispatcher(queue: EventQueue, role: AgentRole = AgentRole.TRIAGE) -> D
 
 
 async def test_an_event_gets_only_one_disposition_per_pass(queue: EventQueue) -> None:
-    event_id = await queue.submit(message(), Priority.NORMAL)
+    event_id = await queue.submit(message(), Priority.BACKGROUND)
     triage = await dispatcher(queue)
 
     await triage.defer(event_id, "not now")
@@ -46,8 +46,8 @@ async def test_an_event_gets_only_one_disposition_per_pass(queue: EventQueue) ->
 async def test_a_rejected_disposition_leaves_the_batch_untouched(
     queue: EventQueue,
 ) -> None:
-    first = await queue.submit(message("one"), Priority.NORMAL)
-    second = await queue.submit(message("two"), Priority.NORMAL)
+    first = await queue.submit(message("one"), Priority.BACKGROUND)
+    second = await queue.submit(message("two"), Priority.BACKGROUND)
     triage = await dispatcher(queue)
 
     await triage.defer(first, "not now")
@@ -62,7 +62,7 @@ async def test_a_rejected_disposition_leaves_the_batch_untouched(
 
 
 async def test_setting_an_event_aside_writes_its_backlog_line(queue: EventQueue) -> None:
-    event_id = await queue.submit(message(), Priority.LOW)
+    event_id = await queue.submit(message(), Priority.BACKGROUND)
     messages = FakeMessages("  mira asked about\n  the gradient banding  ")
     triage = await dispatcher(queue)
     triage.client = SimpleNamespace(messages=messages)  # type: ignore[assignment]
@@ -79,7 +79,7 @@ async def test_setting_an_event_aside_writes_its_backlog_line(queue: EventQueue)
 async def test_keeping_an_event_deferred_rewrites_its_backlog_line(
     queue: EventQueue,
 ) -> None:
-    event_id = await queue.submit(message(), Priority.LOW)
+    event_id = await queue.submit(message(), Priority.BACKGROUND)
     await queue.defer([(event_id, "not now")], agent=await queue.spawn(AgentRole.TRIAGE))
     await queue.set_digest(event_id, "the line triage has been reading")
 
@@ -94,7 +94,7 @@ async def test_keeping_an_event_deferred_rewrites_its_backlog_line(
 async def test_a_failed_digest_leaves_the_previous_line_standing(
     queue: EventQueue,
 ) -> None:
-    event_id = await queue.submit(message(), Priority.LOW)
+    event_id = await queue.submit(message(), Priority.BACKGROUND)
     triage = await dispatcher(queue)  # client is None, so summarizing raises
 
     await triage.defer(event_id, "not now")
@@ -116,9 +116,9 @@ async def test_an_assignment_records_the_streams_it_spanned(queue: EventQueue) -
             summary="done",
             job="render",
         ),
-        Priority.NORMAL,
+        Priority.BACKGROUND,
     )
-    question = await queue.submit(message(), Priority.REALTIME)
+    question = await queue.submit(message(), Priority.ACTIVE)
     triage = await dispatcher(queue)
 
     # No client, so the subagent fails — the streams are recorded either way.
@@ -134,7 +134,7 @@ async def test_a_streamless_event_contributes_no_stream(queue: EventQueue) -> No
         ScheduledEvent(
             timestamp=utcnow(), description="one-off", fires_at=utcnow(), note="once"
         ),
-        Priority.LOW,
+        Priority.BACKGROUND,
     )
     triage = await dispatcher(queue)
 
@@ -146,7 +146,7 @@ async def test_a_streamless_event_contributes_no_stream(queue: EventQueue) -> No
 
 
 async def test_separate_passes_may_revisit_the_same_event(queue: EventQueue) -> None:
-    event_id = await queue.submit(message(), Priority.LOW)
+    event_id = await queue.submit(message(), Priority.BACKGROUND)
 
     triage = await dispatcher(queue)
     await triage.defer(event_id, "not now")

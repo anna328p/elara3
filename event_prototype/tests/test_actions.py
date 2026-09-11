@@ -19,7 +19,7 @@ from conftest import counting_selects, message
 async def test_an_events_history_reads_as_a_sequence(
     queue: EventQueue, triage: Agent
 ) -> None:
-    event_id = await queue.submit(message(), Priority.NORMAL)
+    event_id = await queue.submit(message(), Priority.BACKGROUND)
 
     await queue.defer([(event_id, "no rush")], agent=triage)
     assignment = await queue.assign(
@@ -45,7 +45,7 @@ async def test_the_agents_on_an_entry_come_with_the_entry(
     queue: EventQueue, triage: Agent
 ) -> None:
     """Roles live on the agent row now, and reading them costs no extra query."""
-    event_id = await queue.submit(message(), Priority.NORMAL)
+    event_id = await queue.submit(message(), Priority.BACKGROUND)
     assignment = await queue.assign(
         [event_id], agent=triage, instructions="answer her", action=Action.HANDLE_ONE_EVENT
     )
@@ -66,7 +66,7 @@ async def test_nothing_is_attributed_to_an_agent_the_store_never_minted(
     queue: EventQueue,
 ) -> None:
     """An `Agent` made by hand is not an agent: the foreign key refuses it."""
-    event_id = await queue.submit(message(), Priority.NORMAL)
+    event_id = await queue.submit(message(), Priority.BACKGROUND)
     stranger = Agent(AgentRole.TRIAGE, str(uuid4()))
 
     with pytest.raises(IntegrityError):
@@ -80,7 +80,7 @@ async def test_nothing_is_attributed_to_an_agent_the_store_never_minted(
 async def test_a_sequence_assignment_shares_one_subagent(
     queue: EventQueue, triage: Agent
 ) -> None:
-    ids = [await queue.submit(message(f"m{i}"), Priority.NORMAL) for i in range(3)]
+    ids = [await queue.submit(message(f"m{i}"), Priority.BACKGROUND) for i in range(3)]
 
     assignment = await queue.assign(
         ids, agent=triage, instructions="in order", action=Action.HANDLE_EVENT_SEQUENCE
@@ -95,7 +95,7 @@ async def test_a_sequence_assignment_shares_one_subagent(
 
 
 async def test_failure_is_recorded_and_leaves_the_event_alone(queue: EventQueue) -> None:
-    event_id = await queue.submit(message(), Priority.NORMAL)
+    event_id = await queue.submit(message(), Priority.BACKGROUND)
     subagent = await queue.spawn(AgentRole.SUBAGENT)
 
     await queue.record_failure([event_id], agent=subagent, error="RuntimeError: boom")
@@ -109,8 +109,8 @@ async def test_failure_is_recorded_and_leaves_the_event_alone(queue: EventQueue)
 async def test_sweep_fetches_history_without_a_query_per_event(
     queue: EventQueue, triage: Agent
 ) -> None:
-    deferred = [await queue.submit(message(f"m{i}"), Priority.LOW) for i in range(5)]
-    await queue.submit(message("fresh"), Priority.HIGH)
+    deferred = [await queue.submit(message(f"m{i}"), Priority.BACKGROUND) for i in range(5)]
+    await queue.submit(message("fresh"), Priority.NUDGE)
     await queue.defer([(i, "later") for i in deferred], agent=triage)
 
     with counting_selects() as selects:
@@ -124,8 +124,8 @@ async def test_sweep_fetches_history_without_a_query_per_event(
 async def test_triage_reads_the_queue_in_one_query(
     queue: EventQueue, triage: Agent
 ) -> None:
-    deferred = [await queue.submit(message(f"m{i}"), Priority.LOW) for i in range(5)]
-    pending = await queue.submit(message("fresh"), Priority.HIGH)
+    deferred = [await queue.submit(message(f"m{i}"), Priority.BACKGROUND) for i in range(5)]
+    pending = await queue.submit(message("fresh"), Priority.NUDGE)
     await queue.defer([(i, "later") for i in deferred], agent=triage)
 
     with counting_selects() as selects:
@@ -140,7 +140,7 @@ async def test_triage_reads_the_queue_in_one_query(
 async def test_deferred_history_reaches_the_sweep_prompt_not_the_triage_one(
     queue: EventQueue, triage: Agent
 ) -> None:
-    event_id = await queue.submit(message(), Priority.LOW)
+    event_id = await queue.submit(message(), Priority.BACKGROUND)
     await queue.defer([(event_id, "revisit if it goes unanswered")], agent=triage)
 
     triage_view = await queue.triage_view()
@@ -159,7 +159,7 @@ async def test_deferred_history_reaches_the_sweep_prompt_not_the_triage_one(
 async def test_the_backlog_line_prefers_a_written_digest(
     queue: EventQueue, triage: Agent
 ) -> None:
-    event_id = await queue.submit(message(), Priority.LOW)
+    event_id = await queue.submit(message(), Priority.BACKGROUND)
     await queue.defer([(event_id, "not now")], agent=triage)
 
     def backlog_line() -> str:
@@ -185,18 +185,18 @@ async def test_the_backlog_line_prefers_a_written_digest(
 async def test_escalation_returns_an_event_to_triage(
     queue: EventQueue, triage: Agent
 ) -> None:
-    event_id = await queue.submit(message(), Priority.LOW)
+    event_id = await queue.submit(message(), Priority.BACKGROUND)
     sweeper = await queue.spawn(AgentRole.SWEEP)
     await queue.defer([(event_id, "not yet")], agent=triage)
 
     await queue.escalate(
-        event_id, agent=sweeper, priority=Priority.HIGH, reason="third time round"
+        event_id, agent=sweeper, priority=Priority.NUDGE, reason="third time round"
     )
 
     view = await queue.triage_view()
     assert [row.id for row in view.pending] == [event_id]
     assert view.deferred == []
-    assert view.pending[0].priority is Priority.HIGH
+    assert view.pending[0].priority is Priority.NUDGE
 
 
 async def test_archiving_from_the_sweep_is_recorded_and_final(

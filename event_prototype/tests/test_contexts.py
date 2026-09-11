@@ -91,7 +91,7 @@ def test_the_sent_content_is_the_stored_content() -> None:
 
 
 async def test_a_turn_round_trips_verbatim(queue: EventQueue) -> None:
-    event_id = await queue.submit(message(), Priority.NORMAL)
+    event_id = await queue.submit(message(), Priority.BACKGROUND)
     stream_id = (await queue.get(event_id)).stream_id
     assert stream_id is not None
     context = await queue.context_for(stream_id)
@@ -112,8 +112,8 @@ async def test_a_turn_round_trips_verbatim(queue: EventQueue) -> None:
 
 
 async def test_a_stream_opens_one_context_and_keeps_it(queue: EventQueue) -> None:
-    first = await queue.submit(message(sender="mira"), Priority.NORMAL)
-    second = await queue.submit(message(sender="hal"), Priority.NORMAL)
+    first = await queue.submit(message(sender="mira"), Priority.BACKGROUND)
+    second = await queue.submit(message(sender="hal"), Priority.BACKGROUND)
     stream_id = (await queue.get(first)).stream_id
     assert stream_id is not None
 
@@ -132,13 +132,13 @@ async def test_a_stream_opens_one_context_and_keeps_it(queue: EventQueue) -> Non
 async def test_the_stream_listing_counts_turns_without_multiplying_events(
     queue: EventQueue,
 ) -> None:
-    ids = [await queue.submit(message(f"m{i}"), Priority.LOW) for i in range(3)]
+    ids = [await queue.submit(message(f"m{i}"), Priority.BACKGROUND) for i in range(3)]
     stream_id = (await queue.get(ids[0])).stream_id
     assert stream_id is not None
     context = await queue.context_for(stream_id)
     await queue.append_turns(context.id, [Turn.user("a"), Turn.user("b")])
     # A second stream with no context still lists.
-    await queue.submit(message(conversation="#general"), Priority.LOW)
+    await queue.submit(message(conversation="#general"), Priority.BACKGROUND)
 
     with counting_selects() as selects:
         summaries = {s.stream.id: s for s in await queue.list_streams()}
@@ -163,7 +163,7 @@ async def dispatcher(queue: EventQueue, messages: FakeMessages) -> Dispatcher:
 
 
 async def test_work_in_one_stream_goes_to_its_context(queue: EventQueue) -> None:
-    first = await queue.submit(message("did the render finish?"), Priority.HIGH)
+    first = await queue.submit(message("did the render finish?"), Priority.NUDGE)
     messages = FakeMessages("Told her it finished.")
     triage = await dispatcher(queue, messages)
 
@@ -176,7 +176,7 @@ async def test_work_in_one_stream_goes_to_its_context(queue: EventQueue) -> None
     context = await queue.context_for(stream_id)
     assert subagent == context.agent
 
-    second = await queue.submit(message("and the alpha channel?"), Priority.HIGH)
+    second = await queue.submit(message("and the alpha channel?"), Priority.NUDGE)
     messages.text = "Yes, preserved, as I said it finished."
     with counting_selects() as selects:
         assert await triage.assign([second], "follow up", Action.HANDLE_ONE_EVENT) == subagent
@@ -210,8 +210,8 @@ async def test_work_in_one_stream_goes_to_its_context(queue: EventQueue) -> None
 
 
 async def test_work_across_streams_goes_to_a_one_shot_subagent(queue: EventQueue) -> None:
-    here = await queue.submit(message(conversation="#workshop"), Priority.HIGH)
-    there = await queue.submit(message(conversation="#general"), Priority.HIGH)
+    here = await queue.submit(message(conversation="#workshop"), Priority.NUDGE)
+    there = await queue.submit(message(conversation="#general"), Priority.NUDGE)
     messages = FakeMessages("Handled both.")
     triage = await dispatcher(queue, messages)
 
@@ -228,13 +228,13 @@ async def test_work_across_streams_goes_to_a_one_shot_subagent(queue: EventQueue
     assert outcome.context_id is None
     assert outcome.report == "Handled both."
     # A later assignment in one of those streams opens a context with a new agent.
-    later = await queue.submit(message(conversation="#workshop"), Priority.HIGH)
+    later = await queue.submit(message(conversation="#workshop"), Priority.NUDGE)
     assert await triage.assign([later], "again", Action.HANDLE_ONE_EVENT) != subagent
     await triage.drain()
 
 
 async def test_streams_that_share_a_context_route_to_it(queue: EventQueue) -> None:
-    first = await queue.submit(message(conversation="#workshop"), Priority.HIGH)
+    first = await queue.submit(message(conversation="#workshop"), Priority.NUDGE)
     messages = FakeMessages("On it.")
     triage = await dispatcher(queue, messages)
     subagent = await triage.assign([first], "answer her", Action.HANDLE_ONE_EVENT)
@@ -244,11 +244,11 @@ async def test_streams_that_share_a_context_route_to_it(queue: EventQueue) -> No
     context = await queue.context_for(workshop)
 
     # #general moves into the workshop's conversation; work spanning both now lands there.
-    there = await queue.submit(message(conversation="#general"), Priority.HIGH)
+    there = await queue.submit(message(conversation="#general"), Priority.NUDGE)
     general = (await queue.get(there)).stream_id
     assert general is not None
     await queue.join_context(general, context.id)
-    here = await queue.submit(message(conversation="#workshop"), Priority.HIGH)
+    here = await queue.submit(message(conversation="#workshop"), Priority.NUDGE)
 
     messages.text = "Both handled."
     assert await triage.assign([there, here], "together", Action.HANDLE_EVENT_SEQUENCE) == subagent
@@ -264,7 +264,7 @@ async def test_streams_that_share_a_context_route_to_it(queue: EventQueue) -> No
 
 
 async def test_a_failed_call_leaves_the_events_in_the_transcript(queue: EventQueue) -> None:
-    event_id = await queue.submit(message(), Priority.HIGH)
+    event_id = await queue.submit(message(), Priority.NUDGE)
     triage = Dispatcher(
         queue,
         client=None,  # type: ignore[arg-type]
