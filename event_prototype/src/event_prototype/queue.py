@@ -33,8 +33,10 @@ from .store import (
     TurnRow,
     create_engine,
     init_schema,
+    join_context,
     resolve_context,
     resolve_stream,
+    route,
     session_factory,
     spawn_agent,
     utcnow,
@@ -76,6 +78,16 @@ class StreamSummary:
     last_event_at: datetime | None
     #: How long the conversation in its context has grown. Zero without one.
     turns: int
+
+
+@dataclass(frozen=True, slots=True)
+class Assignment:
+    """What an assignment resolved to: the rows, who got them, and where."""
+
+    rows: list[EventRow]
+    subagent: Agent
+    #: The context the work went to; None means a one-shot subagent.
+    context: ContextRow | None
 
 
 class EventQueue:
@@ -184,17 +196,20 @@ class EventQueue:
         event_ids: Sequence[int],
         *,
         agent: Agent,
-        subagent: Agent,
         instructions: str,
         action: LogAction,
-    ) -> None:
-        """Record that `agent` handed these events to `subagent`.
+    ) -> Assignment:
+        """Route these events, mint a subagent if none is theirs, and log the handoff.
 
-        Written before the subagent runs, so a crash mid-handling still leaves
+        One transaction: a context opened here exists only alongside the log
+        rows that point at its agent, and a crash mid-handling still leaves
         evidence of what was attempted.
         """
         async with self._sessions.begin() as session:
-            await self._require(session, event_ids)
+            rows = await self._require(session, event_ids)
+            context = await route(session, event_ids)
+            actor = context.actor if context else await spawn_agent(session, AgentRole.SUBAGENT)
+            subagent = actor.to_agent()
             self._append(
                 session,
                 [(i, instructions) for i in event_ids],
@@ -202,6 +217,7 @@ class EventQueue:
                 agent,
                 assigned=subagent,
             )
+            return Assignment(rows, subagent, context)
 
     async def complete(self, event_ids: Sequence[int], *, agent: Agent, report: str) -> None:
         """Mark events handled, with the subagent's account of what it did."""
@@ -346,6 +362,11 @@ class EventQueue:
         """The context a stream's work goes to, opened if this is its first."""
         async with self._sessions.begin() as session:
             return await resolve_context(session, stream_id)
+
+    async def join_context(self, stream_id: int, context_id: int) -> None:
+        """Point a stream at an open context, so its work joins that conversation."""
+        async with self._sessions.begin() as session:
+            await join_context(session, stream_id, context_id)
 
     async def append_turns(self, context_id: int, turns: Sequence[Turn]) -> None:
         """Add turns to a context, in order, as one transaction."""

@@ -10,6 +10,7 @@ every default query filters those out, so the audit trail stays intact.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -26,6 +27,7 @@ from sqlalchemy import (
     TypeDecorator,
     UniqueConstraint,
     event,
+    select,
 )
 from sqlalchemy import Enum as SAEnum
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -372,6 +374,14 @@ async def spawn_agent(session: AsyncSession, role: AgentRole) -> AgentRow:
     return row
 
 
+async def load_context(session: AsyncSession, context_id: int) -> ContextRow:
+    """The context with this id. Only a foreign key ever supplies one, so missing is a bug."""
+    context = await session.get(ContextRow, context_id)
+    if context is None:
+        raise RuntimeError(f"no such context: {context_id}")
+    return context
+
+
 async def resolve_context(session: AsyncSession, stream_id: int) -> ContextRow:
     """The context `stream_id` routes to, opened on first need.
 
@@ -385,10 +395,7 @@ async def resolve_context(session: AsyncSession, stream_id: int) -> ContextRow:
     if stream is None:
         raise StreamNotFound(f"no such stream: {stream_id}")
     if stream.context_id is not None:
-        context = await session.get(ContextRow, stream.context_id)
-        if context is None:  # the foreign key says otherwise
-            raise RuntimeError(f"stream {stream_id} routes to a missing context")
-        return context
+        return await load_context(session, stream.context_id)
 
     # Attached as the row rather than by id, so `context.agent` is answerable
     # right away instead of needing a load the async session would refuse.
@@ -397,6 +404,41 @@ async def resolve_context(session: AsyncSession, stream_id: int) -> ContextRow:
     await session.flush()  # for its id
     stream.context_id = context.id
     return context
+
+
+async def join_context(session: AsyncSession, stream_id: int, context_id: int) -> None:
+    """Point a stream at a context already open, so its work joins that conversation."""
+    stream = await session.get(StreamRow, stream_id)
+    if stream is None:
+        raise StreamNotFound(f"no such stream: {stream_id}")
+    stream.context_id = (await load_context(session, context_id)).id
+
+
+async def route(session: AsyncSession, event_ids: Sequence[int]) -> ContextRow | None:
+    """The one context these events belong in, or None for a one-shot subagent.
+
+    One stream routes to its context, opened here if this is its first work.
+    Several streams that already share a context route to it. Anything else —
+    an event outside any stream, or streams whose contexts differ or are not
+    yet open — is the case that will become a message between contexts, and
+    until it is built goes to a subagent that remembers nothing.
+    """
+    query = (
+        select(EventRow.stream_id, StreamRow.context_id)
+        .outerjoin(StreamRow, EventRow.stream_id == StreamRow.id)
+        .where(EventRow.id.in_(event_ids))
+        .distinct()
+    )
+    pairs = list((await session.execute(query)).tuples())
+    match pairs:
+        case [(int() as stream_id, _)]:
+            return await resolve_context(session, stream_id)
+        case [(int(), int() as context_id), *rest] if all(
+            s is not None and c == context_id for s, c in rest
+        ):
+            return await load_context(session, context_id)
+        case _:
+            return None
 
 
 def _enforce_foreign_keys(

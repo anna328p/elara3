@@ -20,16 +20,12 @@ async def test_an_events_history_reads_as_a_sequence(
     queue: EventQueue, triage: Agent
 ) -> None:
     event_id = await queue.submit(message(), Priority.NORMAL)
-    subagent = await queue.spawn(AgentRole.SUBAGENT)
 
     await queue.defer([(event_id, "no rush")], agent=triage)
-    await queue.assign(
-        [event_id],
-        agent=triage,
-        subagent=subagent,
-        instructions="answer her",
-        action=LogAction.HANDLE_ONE_EVENT,
+    assignment = await queue.assign(
+        [event_id], agent=triage, instructions="answer her", action=LogAction.HANDLE_ONE_EVENT
     )
+    subagent = assignment.subagent
     await queue.complete([event_id], agent=subagent, report="answered")
 
     entries = (await queue.history_for([event_id]))[event_id]
@@ -50,14 +46,10 @@ async def test_the_agents_on_an_entry_come_with_the_entry(
 ) -> None:
     """Roles live on the agent row now, and reading them costs no extra query."""
     event_id = await queue.submit(message(), Priority.NORMAL)
-    subagent = await queue.spawn(AgentRole.SUBAGENT)
-    await queue.assign(
-        [event_id],
-        agent=triage,
-        subagent=subagent,
-        instructions="answer her",
-        action=LogAction.HANDLE_ONE_EVENT,
+    assignment = await queue.assign(
+        [event_id], agent=triage, instructions="answer her", action=LogAction.HANDLE_ONE_EVENT
     )
+    subagent = assignment.subagent
 
     with counting_selects() as selects:
         (entry,) = (await queue.history_for([event_id]))[event_id]
@@ -89,15 +81,11 @@ async def test_a_sequence_assignment_shares_one_subagent(
     queue: EventQueue, triage: Agent
 ) -> None:
     ids = [await queue.submit(message(f"m{i}"), Priority.NORMAL) for i in range(3)]
-    subagent = await queue.spawn(AgentRole.SUBAGENT)
 
-    await queue.assign(
-        ids,
-        agent=triage,
-        subagent=subagent,
-        instructions="in order",
-        action=LogAction.HANDLE_EVENT_SEQUENCE,
+    assignment = await queue.assign(
+        ids, agent=triage, instructions="in order", action=LogAction.HANDLE_EVENT_SEQUENCE
     )
+    subagent = assignment.subagent
 
     history = await queue.history_for(ids)
     assert set(history) == set(ids)

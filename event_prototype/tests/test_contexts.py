@@ -178,7 +178,11 @@ async def test_work_in_one_stream_goes_to_its_context(queue: EventQueue) -> None
 
     second = await queue.submit(message("and the alpha channel?"), Priority.HIGH)
     messages.text = "Yes, preserved, as I said it finished."
-    assert await triage.assign([second], "follow up", LogAction.HANDLE_ONE_EVENT) == subagent
+    with counting_selects() as selects:
+        assert await triage.assign([second], "follow up", LogAction.HANDLE_ONE_EVENT) == subagent
+    # Routed and logged in one transaction: the rows (their streams ride along),
+    # the routing pairs, the context — nothing fetched again between steps.
+    assert len(selects) == 3, selects
     await triage.drain()
 
     # One transcript that grew: event, brief, reply, event, brief, reply.
@@ -227,6 +231,36 @@ async def test_work_across_streams_goes_to_a_one_shot_subagent(queue: EventQueue
     later = await queue.submit(message(conversation="#workshop"), Priority.HIGH)
     assert await triage.assign([later], "again", LogAction.HANDLE_ONE_EVENT) != subagent
     await triage.drain()
+
+
+async def test_streams_that_share_a_context_route_to_it(queue: EventQueue) -> None:
+    first = await queue.submit(message(conversation="#workshop"), Priority.HIGH)
+    messages = FakeMessages("On it.")
+    triage = await dispatcher(queue, messages)
+    subagent = await triage.assign([first], "answer her", LogAction.HANDLE_ONE_EVENT)
+    await triage.drain()
+    workshop = (await queue.get(first)).stream_id
+    assert workshop is not None
+    context = await queue.context_for(workshop)
+
+    # #general moves into the workshop's conversation; work spanning both now lands there.
+    there = await queue.submit(message(conversation="#general"), Priority.HIGH)
+    general = (await queue.get(there)).stream_id
+    assert general is not None
+    await queue.join_context(general, context.id)
+    here = await queue.submit(message(conversation="#workshop"), Priority.HIGH)
+
+    messages.text = "Both handled."
+    assert await triage.assign([there, here], "together", LogAction.HANDLE_EVENT_SEQUENCE) == subagent
+    await triage.drain()
+
+    # The one transcript grew by the two events, the brief, and the reply.
+    turns = [row.to_turn() for row in await queue.transcript(context.id)]
+    assert [t.event_id for t in turns] == [first, None, None, there, here, None, None]
+    assert turns[-1].text == "Both handled."
+    (_, outcome) = triage.dispositions
+    assert outcome.context_id == context.id
+    assert len(outcome.streams) == 2  # crossed streams, and still went to the context
 
 
 async def test_a_failed_call_leaves_the_events_in_the_transcript(queue: EventQueue) -> None:

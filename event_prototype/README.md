@@ -83,7 +83,8 @@ connection and not evidence of one — and the clearest reason to group events
 runs the other way, across streams, as when a job's result answers a question
 someone asked somewhere else. That case is why the tool keeps its shape: a
 same-stream assignment hands work to the stream's context (next section), and a
-cross-stream one will become a message between two contexts. The pass report
+cross-stream one goes there too when the streams already share a context;
+otherwise it will become a message between two contexts. The pass report
 prints the streams each assignment spanned, so a crossing is visible when it
 happens.
 
@@ -142,9 +143,9 @@ worth knowing. A prefix under 1024 tokens (2048 on Haiku) is not cached at all,
 so a stream's first exchange or two silently pay full price, and the default
 entry lives five minutes, so the saving lands within a burst of activity rather
 than across the hours between bursts; the one-hour option exists and is a
-decision to make with numbers. Assignments that cross streams, or belong to
-none, still go to a one-shot subagent with a single-turn conversation and ask
-for no caching, since nothing will read it back.
+decision to make with numbers. Assignments that cross streams without sharing
+a context, or belong to none, still go to a one-shot subagent with a single-turn
+conversation and ask for no caching, since nothing will read it back.
 
 ## Shape of the code
 

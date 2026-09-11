@@ -11,21 +11,21 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Coroutine, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
 from anthropic import AsyncAnthropic
 from anthropic.types import Usage
 from mcp.server import MCPServer
 
-from .agents import Agent, AgentRole
+from .agents import Agent
 from .config import Config
 from .contexts import Turn
 from .digest import summarize
 from .events import Priority
-from .queue import EventQueue
+from .queue import Assignment, EventQueue
 from .render import PromptRenderer
-from .store import ContextRow, EventRow, LogAction
+from .store import EventRow, LogAction
 from .subagent import report_of, run_subagent
 
 #: How the models name a priority level, since the stored value is an integer.
@@ -47,38 +47,32 @@ class Disposition:
     report: str | None = None
     error: str | None = None
     #: The streams these events came from, in order and deduplicated. More than
-    #: one means the assignment crossed streams — the case that will become a
+    #: one means the assignment crossed streams: into a context they already
+    #: share, or else to a one-shot subagent — the case that will become a
     #: message between persistent contexts rather than one subagent reading both.
     streams: tuple[str, ...] = ()
-    #: The context the work went to, when the events all lay in one stream.
+    #: The context the work went to; None means a one-shot subagent.
     context_id: int | None = None
     #: What the subagent's call cost, cache reads and writes included.
     usage: Usage | None = None
 
 
+@dataclass
 class Dispatcher:
     """Holds the machinery the tools need, and tracks the work they spawn."""
 
-    def __init__(
-        self,
-        queue: EventQueue,
-        client: AsyncAnthropic,
-        config: Config,
-        renderer: PromptRenderer,
-        agent: Agent,
-    ) -> None:
-        self.queue = queue
-        self.client = client
-        self.config = config
-        self.renderer = renderer
-        #: The triage agent every decision this pass is attributed to.
-        self.agent = agent
+    queue: EventQueue
+    client: AsyncAnthropic
+    config: Config
+    renderer: PromptRenderer
+    #: The triage agent every decision this pass is attributed to.
+    agent: Agent
 
-        self.dispositions: list[Disposition] = []
-        self._tasks: set[asyncio.Task[None]] = set()
-        #: What each event has already been given this pass, so it cannot be
-        #: given a second, contradictory one.
-        self._claimed: dict[int, LogAction] = {}
+    dispositions: list[Disposition] = field(default_factory=lambda: [], init=False)
+    _tasks: set[asyncio.Task[None]] = field(default_factory=lambda: set(), init=False, repr=False)
+    #: What each event has already been given this pass, so it cannot be
+    #: given a second, contradictory one.
+    _claimed: dict[int, LogAction] = field(default_factory=lambda: {}, init=False, repr=False)
 
     async def drain(self) -> None:
         """Wait for every spawned subagent to finish."""
@@ -101,38 +95,16 @@ class Dispatcher:
     ) -> Agent:
         """Hand events to a subagent and start it working.
 
-        Events that all lie in one stream go to that stream's context, and so
-        to the subagent whose context it is; the rest go to a fresh one-shot
-        subagent. The assignment is logged before the task is spawned, so the
-        record exists even if handling never finishes.
+        The queue decides where they go (see `store.route`) and logs the
+        assignment before the task is spawned, so the record exists even if
+        handling never finishes.
         """
         self._claim(event_ids, action)
-        rows = await self.queue.get_many(event_ids)
-        context = await self._context_of(rows)
-        subagent = context.agent if context else await self.queue.spawn(AgentRole.SUBAGENT)
-        await self.queue.assign(
-            event_ids,
-            agent=self.agent,
-            subagent=subagent,
-            instructions=instructions,
-            action=action,
+        assignment = await self.queue.assign(
+            event_ids, agent=self.agent, instructions=instructions, action=action
         )
-        self._spawn(self._handle(rows, instructions, action, subagent, context))
-        return subagent
-
-    async def _context_of(self, rows: Sequence[EventRow]) -> ContextRow | None:
-        """The one context these events belong in, if they share a stream.
-
-        Crossing streams, or belonging to none, means no context: that is the
-        case that will become a message between two contexts, and until it is
-        built the work goes to a subagent that remembers nothing.
-        """
-        stream_ids = {row.stream_id for row in rows}
-        if len(stream_ids) != 1 or None in stream_ids:
-            return None
-        (stream_id,) = stream_ids
-        assert stream_id is not None
-        return await self.queue.context_for(stream_id)
+        self._spawn(self._handle(assignment, instructions, action))
+        return assignment.subagent
 
     async def defer(self, event_id: int, reason: str) -> None:
         self._claim([event_id], LogAction.DEFER_EVENT)
@@ -181,21 +153,15 @@ class Dispatcher:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
-    async def _handle(
-        self,
-        rows: Sequence[EventRow],
-        instructions: str,
-        action: LogAction,
-        subagent: Agent,
-        context: ContextRow | None,
-    ) -> None:
-        """Run one subagent over `rows` and record what came back.
+    async def _handle(self, assignment: Assignment, instructions: str, action: LogAction) -> None:
+        """Run one subagent over the assigned rows and record what came back.
 
         With a context, the events and the brief are appended to it before the
         call and the reply after, so the transcript is the record of what the
         subagent was shown and what it said — a call that fails leaves the
         events in it, which is what happened.
         """
+        rows, subagent, context = assignment.rows, assignment.subagent, assignment.context
         ids = [row.id for row in rows]
         outcome = Disposition(
             action,
