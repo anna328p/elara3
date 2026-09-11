@@ -13,6 +13,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 from .events import BaseEvent, JobEvent, MessageEvent, Priority, ScheduledEvent
+from .memory import ROOT
 from .queue import EventQueue
 from .store import utcnow
 
@@ -177,6 +178,56 @@ def synthetic_events() -> list[tuple[BaseEvent, Priority]]:
     ]
 
 
+#: Two of the senders are known and three are not, so a dry run shows both cases.
+PROFILES: dict[tuple[str, str, str], str] = {
+    ("discord", "mira", "Mira"): (
+        "# Mira\n"
+        "\n"
+        "Known as discord/mira.\n"
+        "\n"
+        "Animator, a regular in #workshop. Asks about renders while a job is running\n"
+        "and wants a straight answer, no preamble.\n"
+        "\n"
+        "## Notes\n"
+        "\n"
+        "- Has been waiting on the overnight render; the alpha channel banding has\n"
+        "  come up before.\n"
+    ),
+    ("discord", "tobias", "Tobias"): (
+        "# Tobias\n"
+        "\n"
+        "Known as discord/tobias.\n"
+        "\n"
+        "Curates the winter showcase. Reached out in DMs about collaborating, and\n"
+        "tends to send the details he forgot in a second message.\n"
+    ),
+}
+
+INDEX = (
+    "# Memory index\n"
+    "\n"
+    "One line per file: what it holds, so a reader knows where to look.\n"
+    "\n"
+    "- [Mira](people/mira.md): animator, #workshop regular\n"
+    "- [Tobias](people/tobias.md): winter showcase curator, collaboration offer\n"
+)
+
+
 async def seed(queue: EventQueue) -> list[int]:
-    """Put the synthetic events on the queue; returns their ids."""
-    return [await queue.submit(event, priority) for event, priority in synthetic_events()]
+    """Put the synthetic events on the queue, and a little memory to go with
+    them; returns the events' ids."""
+    ids = [await queue.submit(event, priority) for event, priority in synthetic_events()]
+    await seed_memory(queue)
+    return ids
+
+
+async def seed_memory(queue: EventQueue) -> None:
+    """An index and two profiles, written by the operator (no agent).
+
+    Linking makes the profile page from the template; the `put` after it is
+    the operator filling it in, so each profile has two versions to look at.
+    """
+    for (venue, username, name), body in PROFILES.items():
+        profile = await queue.people.link(venue, username, name, None)
+        await queue.memory.put(profile.path, body, None)
+    await queue.memory.put(f"{ROOT}/MEMORY.md", INDEX, None)

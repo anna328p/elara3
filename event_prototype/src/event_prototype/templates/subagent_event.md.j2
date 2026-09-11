@@ -3,4 +3,9 @@ Received {{ event.age }} ({{ event.timestamp }})
 {{ event.description }}
 
 {{ event.payload }}
+{% if event.person %}
+<sender name="{{ event.person.name }}" memory="{{ event.person.path }}">
+{{ event.person.body }}
+</sender>
+{% endif %}
 </event>

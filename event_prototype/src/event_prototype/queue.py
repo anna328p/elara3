@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator, Sequence
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from types import TracebackType
@@ -22,7 +22,10 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from .agents import Agent, AgentRole
 from .contexts import Turn
-from .events import Event, Priority, check_priority
+from .events import Event, MessageEvent, Priority, check_priority
+from .memory import MemoryStore
+from .people import PeopleStore, Profile, profiles_for
+from .render import PromptRenderer
 from .store import (
     Action,
     ActionRow,
@@ -90,19 +93,33 @@ class Assignment:
     subagent: Agent
     #: The context the work went to; None means a one-shot subagent.
     context: ContextRow | None
+    #: The profile behind each event's sender, for the events whose sender is
+    #: someone known. Resolved with the assignment, so the subagent is shown
+    #: who it is talking to without a lookup of its own.
+    people: dict[int, Profile] = field(default_factory=lambda: {})
 
 
 class EventQueue:
-    def __init__(self, engine: AsyncEngine, sessions: async_sessionmaker[AsyncSession]) -> None:
+    def __init__(
+        self,
+        engine: AsyncEngine,
+        sessions: async_sessionmaker[AsyncSession],
+        renderer: PromptRenderer | None = None,
+    ) -> None:
         self._engine = engine
         self._sessions = sessions
         self._notifier = Notifier()
+        #: The character's memory and the people in it, over the same sessions.
+        #: Held here so that whoever has the queue has the whole store, and
+        #: nothing reaches for an engine of its own.
+        self.memory = MemoryStore(sessions)
+        self.people = PeopleStore(sessions, renderer or PromptRenderer())
 
     @classmethod
-    async def open(cls, db_path: Path | str) -> Self:
+    async def open(cls, db_path: Path | str, renderer: PromptRenderer | None = None) -> Self:
         engine = create_engine(db_path)
         await init_schema(engine)
-        return cls(engine, session_factory(engine))
+        return cls(engine, session_factory(engine), renderer)
 
     async def aclose(self) -> None:
         await self._engine.dispose()
@@ -215,6 +232,9 @@ class EventQueue:
         One transaction: a context opened here exists only alongside the action
         rows that point at its agent, and a crash mid-handling still leaves
         evidence of what was attempted.
+
+        The senders are looked up here too, in one query for the whole batch,
+        so the events reach the subagent with the people behind them.
         """
         async with self._sessions.begin() as session:
             rows = await self._require(session, event_ids)
@@ -228,7 +248,18 @@ class EventQueue:
                 agent,
                 assigned=subagent,
             )
-            return Assignment(rows, subagent, context)
+            senders = {
+                row.id: (event.venue, event.sender)
+                for row in rows
+                if isinstance(event := row.to_event(), MessageEvent)
+            }
+            profiles = await profiles_for(session, set(senders.values()))
+            people = {
+                event_id: profiles[handle]
+                for event_id, handle in senders.items()
+                if handle in profiles
+            }
+            return Assignment(rows, subagent, context, people)
 
     async def complete(self, event_ids: Sequence[int], *, agent: Agent, report: str) -> None:
         """Mark events handled, with the subagent's account of what it did."""

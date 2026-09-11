@@ -18,6 +18,7 @@ from enum import StrEnum
 from typing import Any, cast
 
 from anthropic.types import Message, MessageParam
+from anthropic.types.beta import BetaMessage, BetaMessageParam
 
 #: One Anthropic content block, as JSON.
 type Block = dict[str, Any]
@@ -55,7 +56,7 @@ class Turn:
         return cls(Role.USER, ({"type": "text", "text": text},), event_id)
 
     @classmethod
-    def of(cls, response: Message) -> Turn:
+    def of(cls, response: Message | BetaMessage) -> Turn:
         """The assistant turn a completion is, blocks dumped verbatim.
 
         `exclude_none` drops the SDK's optional fields (`citations`, say) that
@@ -66,6 +67,19 @@ class Turn:
             block.model_dump(mode="json", exclude_none=True) for block in response.content
         )
         return cls(Role.ASSISTANT, blocks)
+
+    @classmethod
+    def results(cls, message: BetaMessageParam) -> Turn:
+        """The user turn the tool runner answers a call with, blocks kept as sent.
+
+        The runner builds it as `tool_result` blocks in a user message. A bare
+        string is the API's shorthand for one text block and is stored as that,
+        so there is one shape to read back.
+        """
+        content = message["content"]
+        if isinstance(content, str):
+            return cls(Role.USER, ({"type": "text", "text": content},))
+        return cls(Role.USER, tuple(dict(block) for block in content))
 
     @property
     def text(self) -> str:

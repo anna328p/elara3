@@ -36,6 +36,17 @@ class ActionView:
 
 
 @dataclass(frozen=True, slots=True)
+class PersonView:
+    """Who an event's sender is, as the subagent is shown them with the event."""
+
+    name: str
+    #: The profile's root page, so the model can read the live version.
+    path: str
+    #: That page's text as of now, inline, so recall costs no round trip.
+    body: str
+
+
+@dataclass(frozen=True, slots=True)
 class EventView:
     """One event, flattened for a template."""
 
@@ -54,10 +65,18 @@ class EventView:
     #: for events that belong to nothing ongoing.
     stream: str | None = None
     history: tuple[ActionView, ...] = ()
+    #: The sender, when they are someone the character knows. Only the
+    #: subagent's event turn carries one; the passes see the sender's handle.
+    person: PersonView | None = None
 
     @classmethod
     def of(
-        cls, row: EventRow, now: datetime, history: Sequence[ActionRow] = ()
+        cls,
+        row: EventRow,
+        now: datetime,
+        history: Sequence[ActionRow] = (),
+        *,
+        person: PersonView | None = None,
     ) -> EventView:
         return cls(
             id=row.id,
@@ -71,6 +90,7 @@ class EventView:
             summary=row.digest or row.description,
             stream=row.stream.title if row.stream else None,
             history=tuple(ActionView.of(entry) for entry in history),
+            person=person,
         )
 
 
@@ -142,12 +162,27 @@ class PromptRenderer:
     def subagent_system(self) -> str:
         return self._env.get_template("subagent_system.md.j2").render()
 
-    def event(self, row: EventRow, *, now: datetime | None = None) -> str:
-        """One event as a turn. The relative age freezes as of now, which is
-        right for a transcript; the absolute timestamp beside it disambiguates."""
+    def event(
+        self,
+        row: EventRow,
+        *,
+        person: PersonView | None = None,
+        now: datetime | None = None,
+    ) -> str:
+        """One event as a turn, with the sender's profile when they are known.
+
+        The relative age freezes as of now, which is right for a transcript;
+        the absolute timestamp beside it disambiguates. The profile freezes
+        too: the turn is the record of what the subagent was shown."""
         now = now or utcnow()
         return self._env.get_template("subagent_event.md.j2").render(
-            event=EventView.of(row, now)
+            event=EventView.of(row, now, person=person)
+        )
+
+    def person_root(self, name: str, venue: str, username: str) -> str:
+        """A new person's profile page, before anyone has written a thing about them."""
+        return self._env.get_template("person_root.md.j2").render(
+            name=name, venue=venue, username=username
         )
 
     def brief(self, instructions: str, *, sequence: bool) -> str:

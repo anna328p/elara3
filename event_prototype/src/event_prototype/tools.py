@@ -1,32 +1,39 @@
-"""The MCP tools the triage and sweep models use to dispose of events.
+"""The MCP tools the models use: triage's and the sweep's to dispose of events,
+and the subagent's to say who someone is.
 
 Two tool sets over one dispatcher. Triage decides what needs attention now;
 the sweep decides what the leftovers are worth. Handling is shared: it mints a
 subagent, records the assignment, spawns its task and returns immediately, so
 the caller can keep going while subagents run in parallel. `Dispatcher.drain()`
-waits for them at the end of a pass.
+waits for them at the end of a pass. The subagent's own tools are its memory
+and `link_person`; the loop that runs them is `Dispatcher._handle`.
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Coroutine, Sequence
+from collections.abc import AsyncGenerator, Coroutine, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import Any, cast
 
 from anthropic import AsyncAnthropic
-from anthropic.types import Usage
+from anthropic.lib.tools import BetaAsyncFunctionTool
+from anthropic.lib.tools.mcp import async_mcp_tool
+from mcp import Client
 from mcp.server import MCPServer
 
 from .agents import Agent
 from .config import Config
-from .contexts import Turn
+from .contexts import Role, Turn
 from .digest import summarize
 from .events import Priority, PriorityName
+from .memory import MemoryTool
+from .people import PeopleStore
 from .queue import Assignment, EventQueue
-from .render import PromptRenderer
+from .render import PersonView, PromptRenderer
 from .store import Action, EventRow
-from .subagent import report_of, run_subagent
+from .subagent import Spend, Step, SubagentTool, report_of, run_subagent
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,8 +57,21 @@ class Disposition:
     streams: tuple[str, ...] = ()
     #: The context the work went to; None means a one-shot subagent.
     context_id: int | None = None
-    #: What the subagent's call cost, cache reads and writes included.
-    usage: Usage | None = None
+    #: What the subagent's calls cost, cache reads and writes included.
+    usage: Spend | None = None
+
+
+@asynccontextmanager
+async def mcp_tools(server: MCPServer) -> AsyncGenerator[list[BetaAsyncFunctionTool[Any]], None]:
+    """`server`'s tools, wrapped for the tool runner, for as long as the block runs.
+
+    The MCP server runs in this process: the client speaks the same protocol to
+    it over an in-memory transport, with no subprocess to supervise. `.session`
+    is the underlying protocol session the Anthropic bridge calls tools through.
+    """
+    async with Client(server) as mcp:
+        listed = await mcp.list_tools()
+        yield [async_mcp_tool(tool, mcp.session) for tool in listed.tools]
 
 
 @dataclass
@@ -154,9 +174,12 @@ class Dispatcher:
         """Run one subagent over the assigned rows and record what came back.
 
         With a context, the events and the brief are appended to it before the
-        call and the reply after, so the transcript is the record of what the
-        subagent was shown and what it said — a call that fails leaves the
-        events in it, which is what happened.
+        first call and every message of the loop as it happens — the model's
+        replies and the tool results that answer them — so the transcript is
+        the record of what the subagent was shown and what it said. A call
+        that fails leaves the events in it, which is what happened; if it
+        failed with tool calls unanswered, they are answered with the error,
+        so the transcript can still be sent next time.
         """
         rows, subagent, context = assignment.rows, assignment.subagent, assignment.context
         ids = [row.id for row in rows]
@@ -168,35 +191,108 @@ class Dispatcher:
             streams=_streams_of(rows),
             context_id=context.id if context else None,
         )
+        steps: list[Step] = []
+        spend = Spend()
         try:
-            turns = [Turn.user(self.renderer.event(row), event_id=row.id) for row in rows]
+            turns = [
+                Turn.user(self.renderer.event(row, person=_person_of(assignment, row)), event_id=row.id)
+                for row in rows
+            ]
             turns.append(Turn.user(self.renderer.brief(instructions, sequence=len(rows) > 1)))
             if context:
                 await self.queue.append_turns(context.id, turns)
                 turns = [row.to_turn() for row in await self.queue.transcript(context.id)]
-            response = await run_subagent(
-                self.client,
-                self.config,
-                self.renderer.subagent_system(),
-                turns,
-                persistent=context is not None,
-            )
-            if context:
-                await self.queue.append_turns(context.id, [Turn.of(response)])
-            report = report_of(response)
+            memory: SubagentTool = MemoryTool(self.queue.memory, subagent)
+            async with mcp_tools(build_subagent_server(self.queue.people, subagent)) as linked:
+                loop = run_subagent(
+                    self.client,
+                    self.config,
+                    self.renderer.subagent_system(),
+                    turns,
+                    [memory, *linked],
+                    persistent=context is not None,
+                )
+                async for step in loop:
+                    steps.append(step)
+                    if step.message is not None:
+                        spend = spend.plus(step.message.usage)
+                    if context:
+                        await self.queue.append_turns(context.id, [step.turn])
+            report = report_of(steps)
             await self.queue.complete(ids, agent=subagent, report=report)
         except Exception as exc:  # a failed subagent leaves its events for the next pass
-            error = f"{type(exc).__name__}: {exc}"
+            error = _describe(exc)
+            if context:
+                await self._answer_pending(context.id, error)
             await self.queue.record_failure(ids, agent=subagent, error=error)
             self.dispositions.append(replace(outcome, error=error))
             return
-        self.dispositions.append(replace(outcome, report=report, usage=response.usage))
+        self.dispositions.append(replace(outcome, report=report, usage=spend))
+
+    async def _answer_pending(self, context_id: int, error: str) -> None:
+        """Answer tool calls the failure left hanging, so the transcript stays sendable."""
+        transcript = await self.queue.transcript(context_id)
+        if not transcript:
+            return
+        last = transcript[-1].to_turn()
+        if not (unanswered := last.tool_use_ids):
+            return
+        results = tuple(
+            {"type": "tool_result", "tool_use_id": call_id, "content": error, "is_error": True}
+            for call_id in unanswered
+        )
+        await self.queue.append_turns(context_id, [Turn(Role.USER, results)])
+
+
+def _describe(exc: BaseException) -> str:
+    """The failure as one line, seen through the task group the MCP client wraps it in.
+
+    A failure inside `mcp_tools` surfaces as an exception group holding the one
+    exception that happened; the record should name that, not the wrapper.
+    """
+    # Only a group has `exceptions`. Read by name rather than by `isinstance`,
+    # whose narrowing the stubs leave partly unknown for the rest of the function.
+    members = cast("tuple[BaseException, ...] | None", getattr(exc, "exceptions", None))
+    if members is not None and len(members) == 1:
+        return _describe(members[0])
+    return f"{type(exc).__name__}: {exc}"
+
+
+def _person_of(assignment: Assignment, row: EventRow) -> PersonView | None:
+    profile = assignment.people.get(row.id)
+    return profile.view if profile else None
 
 
 def _streams_of(rows: Sequence[EventRow]) -> tuple[str, ...]:
     """The streams these events came from, first seen first, without repeats."""
     titles = (row.stream.title for row in rows if row.stream is not None)
     return tuple(dict.fromkeys(titles))
+
+
+def build_subagent_server(people: PeopleStore, agent: Agent) -> MCPServer:
+    """What a subagent can do besides remember: say whose handle a handle is."""
+    server = MCPServer("elara-subagent")
+
+    @server.tool(name="link_person")
+    async def _link_person(venue: str, username: str, name: str) -> str:
+        """Record that a handle belongs to a person, so their profile is shown
+        with every message they send from now on.
+
+        Call it when you learn who a sender is — from what they say, from
+        context, or because you are told. If nobody by that name is known yet,
+        they and their profile file are created; if the handle is already
+        someone else's, the call is refused and says whose it is.
+
+        Args:
+            venue: The medium the handle is on, as the event's `venue` spells
+                it: "discord", "email".
+            username: The handle, as the event's `sender` spells it.
+            name: The person's name, as their profile is titled.
+        """
+        profile = await people.link(venue, username, name, agent)
+        return f"{venue}/{username} is {profile.name}; their profile is at {profile.path}."
+
+    return server
 
 
 def build_triage_server(dispatcher: Dispatcher) -> MCPServer:

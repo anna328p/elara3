@@ -15,3 +15,7 @@ sweep_effort = "high"
 # `watch` runs triage the moment a nudge or an active event arrives; background
 # and async events wait for this heartbeat.
 heartbeat_seconds = 300
+
+# A subagent's tool loop: this many model calls per assignment at most, the
+# memory tool's reads and edits included, before it is stopped.
+subagent_max_iterations = 8

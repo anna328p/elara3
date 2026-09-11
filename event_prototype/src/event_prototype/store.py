@@ -4,8 +4,11 @@
 decided about each one and by whom — "whom" being a row in `agents`, which every
 attribution points at. `streams` is the ongoing loci events belong to, each
 routed to at most one `contexts` row: the conversation an agent is having there,
-stored as `turns`. Rows are never deleted — archiving stamps `archived_at` and
-every default query filters those out, so the audit trail stays intact.
+stored as `turns`. `memory_entries` are the pages of the character's memory and
+`memory_versions` everything that has ever been true of them; `known_people` and
+`person_names` say whose profile a page is and which handles are theirs. Rows
+are never deleted — archiving stamps `archived_at`, deleting a page appends a
+tombstone, and every default query filters those out, so the trail stays intact.
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
+    Text,
     TypeDecorator,
     UniqueConstraint,
     event,
@@ -333,6 +337,114 @@ class ActionRow(Base):
             f"ActionRow(event_id={self.event_id}, action={self.action.value}, "
             f"agent={self.agent.label!r})"
         )
+
+
+class MemoryEntryRow(Base):
+    """A page's identity: its path, and when it came to be.
+
+    Everything else about a page — its text, whether it exists right now, who
+    last touched it — lives in its versions. The entry is what those hang off,
+    so a page deleted and written again is one entry with one history.
+    """
+
+    __tablename__ = "memory_entries"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    #: Absolute, under `/memories`, normalized (`memory.normalize`). Unique
+    #: outright: a tombstoned page keeps its entry, and writing the path again
+    #: continues that entry rather than opening a second one.
+    path: Mapped[str] = mapped_column(String(512), unique=True)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+    #: Touched by rename, the one thing that changes on the entry itself.
+    updated_at: Mapped[datetime] = mapped_column(default=utcnow, onupdate=utcnow)
+
+    def __repr__(self) -> str:
+        return f"MemoryEntryRow(id={self.id}, path={self.path!r})"
+
+
+class MemoryVersionRow(Base):
+    """A page as of one operation. Append-only; the newest one is the page."""
+
+    __tablename__ = "memory_versions"
+    __table_args__ = (
+        # The head is the greatest id per entry, and a history is one entry's
+        # versions in order. Global order by id is the rowid, indexed already.
+        Index("ix_memory_versions_entry_id", "entry_id", "id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    entry_id: Mapped[int] = mapped_column(ForeignKey("memory_entries.id"))
+    timestamp: Mapped[datetime] = mapped_column(default=utcnow)
+
+    #: Who made the edit. NULL is the operator — an edit from outside the
+    #: agents, at the CLI today — and anything else names an agent the store
+    #: minted, which the foreign key enforces.
+    agent_id: Mapped[str | None] = mapped_column(ForeignKey("agents.id"), default=None)
+    actor: Mapped[AgentRow | None] = relationship(lazy="joined")
+
+    #: The whole page as of this version. NULL is a tombstone: the page does
+    #: not exist as of here, until a later version gives it a body again.
+    body: Mapped[str | None] = mapped_column(Text, default=None)
+    #: The memory tool command that produced this version, verbatim minus the
+    #: path — `{"command": "str_replace", "old_str": …, "new_str": …}` — so the
+    #: history says how each version came to differ from the one before.
+    edit_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+    @property
+    def agent(self) -> Agent | None:
+        return self.actor.to_agent() if self.actor else None
+
+    @property
+    def tombstone(self) -> bool:
+        return self.body is None
+
+    def __repr__(self) -> str:
+        return (
+            f"MemoryVersionRow(id={self.id}, entry_id={self.entry_id}, "
+            f"tombstone={self.tombstone})"
+        )
+
+
+class PersonRow(Base):
+    """Someone the character knows: a name, and the page that is their profile."""
+
+    __tablename__ = "known_people"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str]
+    #: The profile's root page. Joined, since a profile is read to be rendered
+    #: after its session is gone.
+    root_entry_id: Mapped[int] = mapped_column(ForeignKey("memory_entries.id"), unique=True)
+    root: Mapped[MemoryEntryRow] = relationship(lazy="joined")
+    #: NULL is the operator, as on `memory_versions`.
+    created_by: Mapped[str | None] = mapped_column(ForeignKey("agents.id"), default=None)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(default=utcnow, onupdate=utcnow)
+
+    def __repr__(self) -> str:
+        return f"PersonRow(id={self.id}, name={self.name!r})"
+
+
+class PersonNameRow(Base):
+    """A handle on a venue, and whose it is. A handle belongs to one person."""
+
+    __tablename__ = "person_names"
+    __table_args__ = (
+        UniqueConstraint("venue", "username", name="uq_person_names_venue_username"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    person_id: Mapped[int] = mapped_column(ForeignKey("known_people.id"), index=True)
+    person: Mapped[PersonRow] = relationship(lazy="joined")
+    #: The medium, as `MessageEvent.venue` spells it: "discord", "email".
+    venue: Mapped[str] = mapped_column(String(64))
+    #: The handle, as `MessageEvent.sender` spells it.
+    username: Mapped[str] = mapped_column(String(255))
+    created_by: Mapped[str | None] = mapped_column(ForeignKey("agents.id"), default=None)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+    def __repr__(self) -> str:
+        return f"PersonNameRow({self.venue}/{self.username} -> person {self.person_id})"
 
 
 async def resolve_stream(session: AsyncSession, ref: StreamRef) -> int:

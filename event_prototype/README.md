@@ -19,10 +19,18 @@ uv run python -m event_prototype triage             # the real thing
 uv run python -m event_prototype sweep              # reconsider the backlog
 uv run python -m event_prototype context 1      # the conversation stream 1 routes to
 uv run python -m event_prototype watch          # triage on arrival and on the heartbeat, until ^C
+
+uv run python -m event_prototype memory ls      # the memory directory, as the tool shows it
+uv run python -m event_prototype memory cat /memories/people/mira.md
+uv run python -m event_prototype memory log /memories/people/mira.md   # every version: when, who, how
+uv run python -m event_prototype people         # everyone known, with their handles
+uv run python -m event_prototype link discord ines Ines
+echo "# Notes" | uv run python -m event_prototype memory put /memories/notes.md   # a page, written by you
 ```
 
 The live passes need `ANTHROPIC_API_KEY`, read from the `.env` at the repo root.
-Models, efforts and the database path are set in `config.toml`.
+Models, efforts, the subagent's iteration cap and the database path are set in
+`config.toml`.
 
 ## Two passes
 
@@ -212,6 +220,50 @@ The label is free text naming the subscriber and what it does with the wake, in
 the spirit of the reason every action carries; `subscriptions()` lists them, and
 nothing evaluates one.
 
+## Memory
+
+The character remembers in files. `/memories` is a directory of markdown pages
+served to the subagent through Claude's memory tool (`memory_20250818`): the
+model views, creates, edits, renames and deletes files there with the commands
+it was trained on, and the API adds its own instruction to check the directory
+before starting work. `/memories/MEMORY.md` is the index, one line per file, and
+`/memories/people/` holds one file per person, named for them; links between
+files are relative markdown links, so a link is something `view` can open. It
+is the shape claude.ai and Claude Code use, and deliberately the plain one:
+search, fading and dreams are later layers that will sit on this.
+
+None of it is on disk. A page is a row in `memory_entries` (its path) and a run
+of rows in `memory_versions` (its text after every operation), and the tool's
+filesystem is a view over them: a directory is what the live paths imply,
+derived in SQL when a listing is asked for, and a file's contents are its newest
+version. Every operation appends a version — edits, renames and deletions alike
+— so the trail is complete and any version reads back on its own; the details
+are under "State and record".
+
+A person is a name and a root page, plus handles: a username on a venue, as
+`MessageEvent` spells its `venue` and `sender`, and a handle belongs to one
+person. When events are assigned, their senders are looked up in one query and
+each known sender's profile rides along, so the event turn the subagent reads
+carries a `<sender>` element with the person's name, the path of their page and
+its current text inline. Recall costs no round trip; the path is there for when
+the page has been edited since. The subagent has one tool besides memory,
+`link_person`, for the moment it learns who a handle belongs to: the person and
+their page are created if new, and from then on their profile arrives with every
+message they send. `link` does the same from the command line.
+
+The subagent is a tool loop now rather than a single call, and every message of
+it is a turn in the context: the model's reply, the tool results that answer it,
+the next reply. Results are stored before the next request goes out, so the
+transcript never trails what the API has seen, and a call that fails with tool
+calls outstanding gets them answered with the error, so the transcript can still
+be sent next time. `subagent_max_iterations` caps the calls per assignment; a run
+that hits it says so in its report.
+
+Memory edited from outside the agents — `memory put` at the CLI today, a browser
+later — is attributed to nobody, which the store spells as a NULL agent and the
+CLI prints as "operator". `memory ls`, `cat` and `log` read; `people` and
+`link` do the same for people.
+
 ## Shape of the code
 
 | module | what it holds |
@@ -220,13 +272,15 @@ nothing evaluates one.
 | `agents.py` | agent identity: the role and UUID of a row the store mints when an agent starts |
 | `streams.py` | stream identity: the kind of locus, its key and its label |
 | `contexts.py` | a turn, and the transform from a transcript to an API message list |
-| `store.py` | the six SQLAlchemy rows, the resolvers and the spawner, and engine setup |
-| `queue.py` | `EventQueue`: submit, edit, the dispositions, and the two views |
+| `store.py` | the ten SQLAlchemy rows, the resolvers and the spawner, and engine setup |
+| `queue.py` | `EventQueue`: submit, edit, the dispositions, the two views, and the memory and people stores |
+| `memory.py` | pages as versions, the listing query, and the memory tool's six commands over them |
+| `people.py` | known people: handles, profile pages, and the senders behind a batch of events |
 | `render.py` + `templates/` | rows → prompts |
-| `tools.py` | the two tool sets and the dispatcher they act on |
+| `tools.py` | the three tool sets, the dispatcher, and the subagent's loop |
 | `runner.py` | driving one model pass against one tool set |
 | `triage.py` / `sweep.py` | the two passes, tying the above together |
-| `subagent.py` | the model call that handles assigned events |
+| `subagent.py` | the tool loop that handles assigned events, one message at a time |
 | `wake.py` | a subscription: the two records a wake can be, and the notifier the queue owns |
 | `scheduler.py` | `watch`: when a triage pass should happen |
 | `digest.py` | the model call that writes an event's backlog line |
@@ -256,9 +310,32 @@ not arrive in the order they happened.
 
 `contexts` holds the agent whose conversation it is, and `turns` the
 conversation, ordered by id within a context in the same way `event_actions` is
-ordered within an event. Turns are appended before the subagent is called and
-after it replies, so a call that fails leaves the events it was shown in the
-transcript, which is what happened; the failure itself goes to `event_actions`.
+ordered within an event. Turns are appended before the subagent's first call and
+after every message of its loop, so a call that fails leaves the events it was
+shown in the transcript, which is what happened; the failure itself goes to
+`event_actions`.
+
+`memory_entries` is a page's identity: its path, unique, and when it came to be.
+`memory_versions` is everything else, append-only: the whole page as of each
+operation, who did it and when, and `edit_metadata`, the memory tool command
+that produced it, verbatim minus the path, so the history says how each version
+came to differ from the one before. The head of an entry is its greatest version
+id, found through an index on `(entry_id, id)`, and the entry itself never says
+whether the page exists, since that is the head's business: a version with no
+body is a tombstone, and a page deleted and written again is one entry whose
+versions are its whole life. Rename changes the entry's path and appends a
+version carrying the old and new names, so the old one is still in the trail. A
+listing is one statement: a CTE of the live heads under the prefix, split into
+first and second path segments with `substr` and `instr`, grouped and summed at
+each level and unioned with the total; Python only formats the rows.
+
+`known_people` is a name and the entry that is its root page; `person_names` is
+a handle and whose it is, unique on `(venue, username)`. Both, like
+`memory_versions`, take a NULL agent to mean the operator, and the foreign key
+still holds every non-null attribution to an agent the store minted. Editing the
+rows with the `sqlite3` shell bypasses all this — the shell does not enforce
+foreign keys unless told — which is why the CLI can write memory: so there is no
+reason to.
 
 Reads are indexed on `(event_id, timestamp)` and never go per-event. Triage is a
 single query, since the digest needs no history at all; the sweep is two, one for
@@ -273,9 +350,12 @@ both passes, but `list --all` still shows it, actions and all.
 
 ## What it doesn't do
 
-Subagents are a single model call with no tools, so they describe how they would
-handle an event rather than doing it; the transcript can hold a tool loop, but
-nothing runs one. Contexts only grow: there is no collapse or compaction, and no
+Subagents cannot act outside memory: they have the memory tool and
+`link_person` and nothing that sends a message, so they describe how they would
+handle an event rather than doing it. Memory has no search, no fading and no
+dreams; the model finds things by reading the index and the directory, and a
+person is only ever found by a handle that was linked. Contexts only grow: there
+is no collapse or compaction, and no
 message from one context to another, so a cross-stream assignment still goes to
 a subagent that remembers nothing. `watch` decides when triage happens, but
 the sweep is still a command you run rather than something that fires on idle

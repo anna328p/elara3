@@ -1,24 +1,29 @@
-"""Command line for the prototype: seed the queue, look at it, triage it, watch it."""
+"""Command line for the prototype: seed the queue, look at it, triage it, watch
+it, and read or write the character's memory as the operator."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
+import sys
 import textwrap
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from anthropic.lib.tools import ToolError
+
 from .config import DEFAULT_CONFIG_PATH, Config
 from .contexts import Block
 from .fixtures import seed
+from .memory import ROOT
 from .queue import EventQueue
 from .render import PromptRenderer
 
 if TYPE_CHECKING:
-    from anthropic.types import Usage
-
     from .runner import PassResult
+    from .subagent import Spend
 
 
 def main() -> None:
@@ -56,6 +61,27 @@ def main() -> None:
 
     sub.add_parser("watch", help="triage on arrival and on the heartbeat, until ^C")
 
+    memory_cmd = sub.add_parser("memory", help="read and write the character's memory")
+    memory_sub = memory_cmd.add_subparsers(dest="memory_command", required=True)
+    ls_cmd = memory_sub.add_parser("ls", help="list a directory, as the memory tool shows it")
+    ls_cmd.add_argument("prefix", nargs="?", default=ROOT, help=f"a directory under {ROOT}")
+    cat_cmd = memory_sub.add_parser("cat", help="print a page")
+    cat_cmd.add_argument("path")
+    log_cmd = memory_sub.add_parser("log", help="every version of a page, oldest first")
+    log_cmd.add_argument("path")
+    put_cmd = memory_sub.add_parser(
+        "put", help="write a whole page from a file or stdin, as the operator"
+    )
+    put_cmd.add_argument("path")
+    put_cmd.add_argument("file", nargs="?", type=Path, help="defaults to stdin")
+
+    sub.add_parser("people", help="everyone the character knows, with their handles")
+
+    link_cmd = sub.add_parser("link", help="say which handle belongs to whom")
+    link_cmd.add_argument("venue", help='the medium, as events spell it: "discord"')
+    link_cmd.add_argument("username", help="the handle, as events spell the sender")
+    link_cmd.add_argument("name", help="the person, as their profile is titled")
+
     args = parser.parse_args()
     config = Config.load(args.config)
     # The MCP server turns on INFO logging, which makes httpx narrate every
@@ -67,6 +93,9 @@ def main() -> None:
         # ^C cancels the main task and everything unwinds before this is
         # re-raised; nothing inside catches CancelledError.
         print("\nStopped.")
+    except (ToolError, ValueError) as exc:
+        # The memory tool's errors are written for the model; they read fine here too.
+        raise SystemExit(f"error: {exc}") from None
 
 
 async def _dispatch(args: argparse.Namespace, config: Config) -> None:
@@ -83,6 +112,12 @@ async def _dispatch(args: argparse.Namespace, config: Config) -> None:
             await _pass(config, which, dry_run=args.dry_run)
         case "watch":
             await _watch(config)
+        case "memory":
+            await _memory(config, args)
+        case "people":
+            await _people(config)
+        case "link":
+            await _link(config, args.venue, args.username, args.name)
         case unknown:  # argparse rejects anything else first
             raise AssertionError(f"unhandled command: {unknown}")
 
@@ -156,6 +191,53 @@ async def _context(config: Config, stream_id: int) -> None:
         for block in turn.content:
             print(textwrap.indent(_show_block(block), "    "))
         print()
+
+
+async def _memory(config: Config, args: argparse.Namespace) -> None:
+    """Memory as the operator sees it. Writes carry no agent: NULL is the operator."""
+    async with await EventQueue.open(config.db_path) as queue:
+        match args.memory_command:
+            case "ls":
+                print(await queue.memory.listing(args.prefix))
+            case "cat":
+                body = await queue.memory.read(args.path)
+                if body is None:
+                    raise SystemExit(f"error: no page at {args.path}")
+                print(body, end="" if body.endswith("\n") else "\n")
+            case "log":
+                versions = await queue.memory.history(args.path)
+                if not versions:
+                    raise SystemExit(f"error: nothing has ever been at {args.path}")
+                for version in versions:
+                    row = version.row
+                    stamp = row.timestamp.isoformat(timespec="seconds")
+                    state = "tombstone" if row.body is None else f"{len(row.body)} chars"
+                    what = json.dumps(row.edit_metadata, ensure_ascii=False)
+                    print(f"[{row.id:>4}] {stamp}  {version.actor:<18} {state:<12} {what}")
+            case "put":
+                body = args.file.read_text() if args.file else sys.stdin.read()
+                print(await queue.memory.put(args.path, body, None))
+            case unknown:
+                raise AssertionError(f"unhandled memory command: {unknown}")
+
+
+async def _people(config: Config) -> None:
+    async with await EventQueue.open(config.db_path) as queue:
+        people = await queue.people.people()
+    if not people:
+        print("Nobody known yet.")
+        return
+    for person, handles in people:
+        print(
+            f"[{person.id:>3}] {person.name:<20} {person.root.path:<36} "
+            f"{', '.join(handles) or '—'}"
+        )
+
+
+async def _link(config: Config, venue: str, username: str, name: str) -> None:
+    async with await EventQueue.open(config.db_path) as queue:
+        profile = await queue.people.link(venue, username, name, None)
+    print(f"{venue}/{username} is {profile.name}; profile at {profile.path}")
 
 
 def _show_block(block: Block) -> str:
@@ -247,12 +329,12 @@ def _plural(count: int, noun: str) -> str:
     return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
 
 
-def _show_usage(usage: Usage) -> str:
+def _show_usage(spend: Spend) -> str:
     """Input tokens with how many the cache served, since that is the point."""
-    read = usage.cache_read_input_tokens or 0
-    written = usage.cache_creation_input_tokens or 0
-    total = usage.input_tokens + read + written
-    return f"{total} in: {read} cached, {written} newly cached; {usage.output_tokens} out"
+    return (
+        f"{spend.total_input} in: {spend.cache_read} cached, "
+        f"{spend.cache_written} newly cached; {spend.output} out"
+    )
 
 
 def _report(result: PassResult) -> None:

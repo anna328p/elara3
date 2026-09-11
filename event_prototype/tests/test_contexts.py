@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -18,7 +17,7 @@ from event_prototype.render import PromptRenderer
 from event_prototype.store import Action, Status
 from event_prototype.tools import Dispatcher
 
-from conftest import FakeMessages, completion, counting_selects, message
+from conftest import FakeClient, completion, counting_selects, message, reply
 
 # -- the transform, no database needed --------------------------------------
 
@@ -152,10 +151,10 @@ async def test_the_stream_listing_counts_turns_without_multiplying_events(
 # -- dispatch -------------------------------------------------------------
 
 
-async def dispatcher(queue: EventQueue, messages: FakeMessages) -> Dispatcher:
+async def dispatcher(queue: EventQueue, client: FakeClient) -> Dispatcher:
     return Dispatcher(
         queue,
-        client=SimpleNamespace(messages=messages),  # type: ignore[arg-type]
+        client=client,  # type: ignore[arg-type]
         config=Config(),
         renderer=PromptRenderer(),
         agent=await queue.spawn(AgentRole.TRIAGE),
@@ -164,8 +163,8 @@ async def dispatcher(queue: EventQueue, messages: FakeMessages) -> Dispatcher:
 
 async def test_work_in_one_stream_goes_to_its_context(queue: EventQueue) -> None:
     first = await queue.submit(message("did the render finish?"), Priority.NUDGE)
-    messages = FakeMessages("Told her it finished.")
-    triage = await dispatcher(queue, messages)
+    client = FakeClient("Told her it finished.")
+    triage = await dispatcher(queue, client)
 
     subagent = await triage.assign([first], "answer her", Action.HANDLE_ONE_EVENT)
     await triage.drain()
@@ -177,12 +176,13 @@ async def test_work_in_one_stream_goes_to_its_context(queue: EventQueue) -> None
     assert subagent == context.agent
 
     second = await queue.submit(message("and the alpha channel?"), Priority.NUDGE)
-    messages.text = "Yes, preserved, as I said it finished."
+    client.text = "Yes, preserved, as I said it finished."
     with counting_selects() as selects:
         assert await triage.assign([second], "follow up", Action.HANDLE_ONE_EVENT) == subagent
     # Routed and recorded in one transaction: the rows (their streams ride along),
-    # the routing pairs, the context — nothing fetched again between steps.
-    assert len(selects) == 3, selects
+    # the routing pairs, the context, the senders' profiles — nothing fetched
+    # again between steps, and the profiles in one query however many events.
+    assert len(selects) == 4, selects
     await triage.drain()
 
     # One transcript that grew: event, brief, reply, event, brief, reply.
@@ -192,12 +192,12 @@ async def test_work_in_one_stream_goes_to_its_context(queue: EventQueue) -> None
     assert turns[2].text == "Told her it finished."
 
     # The second call sent the first call's turns ahead of its own...
-    sent = messages.calls[1]["messages"]
+    sent = client.calls[1]["messages"]
     assert [m["role"] for m in sent] == ["user", "assistant", "user"]
     assert "did the render finish?" in str(sent[0]["content"])
     # ...under a system prompt, asking for the prefix to be cached.
-    assert messages.calls[1]["system"] == PromptRenderer().subagent_system()
-    assert messages.calls[1]["cache_control"] == {"type": "ephemeral"}
+    assert client.calls[1]["system"] == PromptRenderer().subagent_system()
+    assert client.calls[1]["cache_control"] == {"type": "ephemeral"}
 
     # And the actions show one subagent handling the stream twice.
     history = await queue.history_for([first, second])
@@ -212,15 +212,15 @@ async def test_work_in_one_stream_goes_to_its_context(queue: EventQueue) -> None
 async def test_work_across_streams_goes_to_a_one_shot_subagent(queue: EventQueue) -> None:
     here = await queue.submit(message(conversation="#workshop"), Priority.NUDGE)
     there = await queue.submit(message(conversation="#general"), Priority.NUDGE)
-    messages = FakeMessages("Handled both.")
-    triage = await dispatcher(queue, messages)
+    client = FakeClient("Handled both.")
+    triage = await dispatcher(queue, client)
 
     subagent = await triage.assign([here, there], "together", Action.HANDLE_EVENT_SEQUENCE)
     await triage.drain()
 
     # No stream was routed, nothing was written, and nothing asked to be cached.
     assert all(s.stream.context_id is None for s in await queue.list_streams())
-    (call,) = messages.calls
+    (call,) = client.calls
     assert isinstance(call["cache_control"], Omit)
     assert [m["role"] for m in call["messages"]] == ["user"]
     assert "in the order given" in str(call["messages"][0]["content"])
@@ -235,8 +235,8 @@ async def test_work_across_streams_goes_to_a_one_shot_subagent(queue: EventQueue
 
 async def test_streams_that_share_a_context_route_to_it(queue: EventQueue) -> None:
     first = await queue.submit(message(conversation="#workshop"), Priority.NUDGE)
-    messages = FakeMessages("On it.")
-    triage = await dispatcher(queue, messages)
+    client = FakeClient("On it.")
+    triage = await dispatcher(queue, client)
     subagent = await triage.assign([first], "answer her", Action.HANDLE_ONE_EVENT)
     await triage.drain()
     workshop = (await queue.get(first)).stream_id
@@ -250,7 +250,7 @@ async def test_streams_that_share_a_context_route_to_it(queue: EventQueue) -> No
     await queue.join_context(general, context.id)
     here = await queue.submit(message(conversation="#workshop"), Priority.NUDGE)
 
-    messages.text = "Both handled."
+    client.text ="Both handled."
     assert await triage.assign([there, here], "together", Action.HANDLE_EVENT_SEQUENCE) == subagent
     await triage.drain()
 
@@ -284,3 +284,123 @@ async def test_a_failed_call_leaves_the_events_in_the_transcript(queue: EventQue
     assert (await queue.get(event_id)).status is Status.PENDING
     (outcome,) = triage.dispositions
     assert outcome.error is not None
+
+
+# -- the tool loop ----------------------------------------------------------
+
+MIRA = "/memories/people/mira.md"
+
+
+async def test_the_loop_stores_every_message_and_the_edit_lands_in_memory(
+    queue: EventQueue,
+) -> None:
+    await queue.people.link("discord", "mira", "Mira", None)
+    event_id = await queue.submit(message("call me M from now on"), Priority.NUDGE)
+    view = ("toolu_view", "memory", {"command": "view", "path": MIRA})
+    edit = (
+        "toolu_edit",
+        "memory",
+        {"command": "str_replace", "path": MIRA, "old_str": "# Mira", "new_str": "# Mira (M)"},
+    )
+    client = FakeClient(
+        script=[
+            reply(tool_calls=[view]),
+            reply("Noted.", tool_calls=[edit], cache_read=40),
+            reply("Updated her profile.", cache_read=80),
+        ]
+    )
+    triage = await dispatcher(queue, client)
+
+    subagent = await triage.assign([event_id], "note it", Action.HANDLE_ONE_EVENT)
+    await triage.drain()
+
+    # Event, brief, then reply / results / reply / results / reply: all stored, in order.
+    stream_id = (await queue.get(event_id)).stream_id
+    assert stream_id is not None
+    context = await queue.context_for(stream_id)
+    turns = [row.to_turn() for row in await queue.transcript(context.id)]
+    assert [t.role for t in turns] == [Role.USER] * 2 + [Role.ASSISTANT, Role.USER] * 2 + [Role.ASSISTANT]
+    assert turns[2].tool_use_ids == ("toolu_view",) and turns[3].tool_result_ids == ("toolu_view",)
+    assert "Known as discord/mira" in str(turns[3].content)  # the page, as the tool showed it
+    assert turns[5].content[0].get("is_error") is None  # the edit went through
+    # The event turn carried her profile before the model asked for anything.
+    assert '<sender name="Mira"' in str(turns[0].content)
+
+    # The edit is in memory, attributed to the subagent, in the tool's own words.
+    body = await queue.memory.read(MIRA)
+    assert body is not None and body.startswith("# Mira (M)")
+    (version,) = [
+        v for v in await queue.memory.history(MIRA) if v.row.edit_metadata["command"] == "str_replace"
+    ]
+    assert version.row.agent == subagent
+
+    # Each call sent the transcript so far and asked for the prefix to be cached.
+    assert [len(call["messages"]) for call in client.calls] == [1, 3, 5]
+    assert all(call["cache_control"] == {"type": "ephemeral"} for call in client.calls)
+    (outcome,) = triage.dispositions
+    assert outcome.report == "Updated her profile."
+    assert outcome.usage is not None
+    assert (outcome.usage.cache_read, outcome.usage.output) == (120, 15)
+    assert (await queue.get(event_id)).status is Status.COMPLETED
+
+
+async def test_the_subagent_can_say_who_a_sender_is(queue: EventQueue) -> None:
+    event_id = await queue.submit(message("it's ines, from the august workshop", sender="ines"), Priority.NUDGE)
+    link = ("toolu_link", "link_person", {"venue": "discord", "username": "ines", "name": "Ines"})
+    client = FakeClient(script=[reply(tool_calls=[link]), reply("Linked her.")])
+    triage = await dispatcher(queue, client)
+
+    subagent = await triage.assign([event_id], "work out who this is", Action.HANDLE_ONE_EVENT)
+    await triage.drain()
+
+    ((person, handles),) = await queue.people.people()
+    assert (person.name, handles, person.created_by) == ("Ines", ["discord/ines"], subagent.id)
+    assert await queue.memory.read("/memories/people/ines.md") == "# Ines\n\nKnown as discord/ines.\n\n## Notes\n\n"
+    stream_id = (await queue.get(event_id)).stream_id
+    assert stream_id is not None
+    context = await queue.context_for(stream_id)
+    turns = [row.to_turn() for row in await queue.transcript(context.id)]
+    assert "their profile is at /memories/people/ines.md" in str(turns[3].content)
+
+    # From now on her profile arrives with whatever she sends.
+    later = await queue.submit(message("hi again", sender="ines"), Priority.NUDGE)
+    client.text = "Hello again."
+    await triage.assign([later], "reply", Action.HANDLE_ONE_EVENT)
+    await triage.drain()
+    assert '<sender name="Ines" memory="/memories/people/ines.md">' in str(client.calls[-1]["messages"][-1])
+
+
+async def test_a_failure_with_tool_calls_outstanding_is_answered_in_the_transcript(
+    queue: EventQueue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    event_id = await queue.submit(message(), Priority.NUDGE)
+    view = ("toolu_view", "memory", {"command": "view", "path": "/memories"})
+    client = FakeClient(script=[reply(tool_calls=[view]), reply("never reached")])
+    triage = await dispatcher(queue, client)
+
+    # The harness falls over once, exactly as the tool results are being stored.
+    original = queue.append_turns
+    failures = ["disk full"]
+
+    async def flaky(context_id: int, turns: list[Turn]) -> None:
+        if failures and any(t.tool_result_ids for t in turns):
+            raise RuntimeError(failures.pop())
+        await original(context_id, turns)
+
+    monkeypatch.setattr(queue, "append_turns", flaky)
+    await triage.assign([event_id], "look around", Action.HANDLE_ONE_EVENT)
+    await triage.drain()
+
+    stream_id = (await queue.get(event_id)).stream_id
+    assert stream_id is not None
+    context = await queue.context_for(stream_id)
+    turns = [row.to_turn() for row in await queue.transcript(context.id)]
+    assert [t.role for t in turns] == [Role.USER, Role.USER, Role.ASSISTANT, Role.USER]
+    assert turns[-1].content == (
+        {"type": "tool_result", "tool_use_id": "toolu_view", "content": "RuntimeError: disk full", "is_error": True},
+    )
+    to_api(turns)  # sendable: nothing is left hanging
+    assert (await queue.get(event_id)).status is Status.PENDING
+    (outcome,) = triage.dispositions
+    assert outcome.error == "RuntimeError: disk full"
+    assert len(client.calls) == 1

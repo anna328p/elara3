@@ -25,6 +25,9 @@ class Config:
     sweep_effort: Effort = "high"
     #: How often `watch` runs triage when nothing immediate has arrived.
     heartbeat_seconds: float = 300.0
+    #: How many model calls a subagent may make in one assignment before it is
+    #: stopped. Every call after the first is a round of tool results.
+    subagent_max_iterations: int = 8
 
     @classmethod
     def load(cls, path: Path = DEFAULT_CONFIG_PATH) -> Config:
@@ -48,4 +51,10 @@ class Config:
             if seconds <= 0:
                 raise ValueError(f"heartbeat_seconds must be positive, not {seconds!r}")
             raw["heartbeat_seconds"] = seconds
+        if (cap := raw.get("subagent_max_iterations")) is not None:
+            # `bool` is an int to `isinstance`, and `true` is not a count.
+            if isinstance(cap, bool) or not isinstance(cap, int) or cap < 1:
+                raise ValueError(
+                    f"subagent_max_iterations must be a positive integer, not {cap!r}"
+                )
         return cls(**raw)
