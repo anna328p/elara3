@@ -2,7 +2,7 @@
 
 A sketch. It describes the finished design, not the decisions behind it, using
 the prototype's terms (`../README.md`): events, streams, contexts, the two
-passes, and the wake-ups that `watch` runs on.
+passes, the wake-ups that `watch` runs on, and the memory and people stores.
 
 ## Context
 
@@ -56,6 +56,50 @@ personality model's tools.
 
 The thread serves conversational agents only. A job stream therefore cannot be
 made live, and the tool needs no separate check for it.
+
+## Who is speaking
+
+The memory branch gives the character known people: a name, a root page at
+`/memories/people/<slug>.md`, and handles, one `(venue, username)` per row,
+each belonging to one person. `assign` looks up the senders of a batch in one
+query, and the event turn of a known sender carries a `<sender>` element with
+the person's name, the path of their page, and the page's current text. It does
+this on every event.
+
+In a conversational agent's context, a person's profile is presented once: with
+the first event from them in that context, and not with later ones. The
+context keeps every turn, so the agent has already read the profile, and
+repeating it on each message adds tokens to a prefix that would otherwise be
+cached. The same rule applies to batch assignments and to the thread's claims,
+since both append event turns the same way. A one-shot subagent has no context
+to compare against, so it is shown every known sender's profile, as now.
+
+The turn records what it presented:
+
+```python
+class TurnRow(Base):
+    ...
+    #: The memory version this turn presented as the sender's profile, if it
+    #: presented one. The person is reachable through the version's entry,
+    #: which is their root page.
+    profile_version_id: Mapped[int | None] = mapped_column(
+        ForeignKey("memory_versions.id"), default=None
+    )
+```
+
+The people already presented in a context are one query: the persons whose
+root entry has a version referenced by a turn of that context. Recording the
+version rather than the person keeps one fact in one place, since the version
+determines the person, and it also records exactly which text the agent saw.
+
+When events are appended to a context, in `assign` and in the thread, the
+batch's senders are looked up as now, the people already presented in the
+context are subtracted, and within the batch only the first event from each
+remaining person gets the profile. The turn that presents an event opens with
+the `<sender>` element and the `<event>` follows it, so the template moves the
+element ahead of the event. The rule concerns profiles presented, not senders
+seen: a sender who was unknown when they first wrote, and whom the agent later
+links with `link_person`, is presented with their next event.
 
 ## The live context
 
@@ -172,14 +216,17 @@ the queue alongside `watch`. Each iteration:
    agent, which is taking the events for itself. All pending events are taken
    at once, so three messages that arrived during the previous call become one
    user message; `contexts.to_api` already merges consecutive user turns.
-3. Append the events as turns plus one brief, `live.md.j2`: this conversation
-   is happening now; answer what needs answering, and say nothing if nothing
-   does. The brief is a turn and not a change of system prompt, so the cached
-   prefix survives the change of mode.
-4. Call the conversational agent with one tool, `yield_focus(reason)`. Append
-   the reply, complete the events with the reply as their report, and if the
-   tool was called, append its result and record a `RELEASE` shift attributed
-   to that agent.
+3. Append the events as turns, each with the sender's profile if this is the
+   person's first presentation in the context, plus one brief, `live.md.j2`:
+   this conversation is happening now; answer what needs answering, say
+   nothing if nothing does, and reply before writing to memory. The brief is a
+   turn and not a change of system prompt, so the cached prefix survives the
+   change of mode.
+4. Run the conversational agent's loop with its usual tools, `memory` and
+   `link_person`, plus `yield_focus(reason)`. Append each message of the loop
+   as the subagent runner does, complete the events with the final reply as
+   their report, and if `yield_focus` was called, record a `RELEASE` shift
+   attributed to that agent.
 5. Repeat. The wait has a timeout of `focus_idle_seconds`, measured from the
    live context's last event. A `Heartbeat` with nothing pending in the
    context and no reply owed is also a `RELEASE`, attributed to the same agent,
@@ -196,9 +243,10 @@ previous run is released the same way. On shutdown, the loop releases in a
 that a dead thread does not keep holding focus; the prototype has one process
 and a `finally`.
 
-The thread's calls use `realtime_model` and `realtime_effort`, both set low.
-The goal is a reply within seconds, and the same agent will continue the same
-context at higher effort when triage next assigns into it.
+The thread's calls use `realtime_model` and `realtime_effort`, both set low,
+and the same `subagent_max_iterations` cap as batch work. The goal is a reply
+within seconds, and the same agent will continue the same context at higher
+effort when triage next assigns into it.
 
 ## Config
 
@@ -242,16 +290,19 @@ because realtime is urgent. The pass sees one event in a direct stream and
 nothing live, and calls `divert_attention`. `resolve_context` opens a context
 with a conversational agent, the `ACQUIRE` row commits, the dispatcher claims
 Alice's message for the thread, and the queue wakes with `Shifted`. The thread
-reads the focus, claims the message with an `ATTEND`, appends the event turn
-and the live brief, calls the conversational agent at low effort with
-`yield_focus` available, appends the reply, and completes the event with the
-reply as its report. No other loop makes routing decisions, so there is no
-race between them.
+reads the focus and claims the message with an `ATTEND`. Alice's handle is
+linked to a known person and nothing has been presented in this new context,
+so the event turn opens with her profile and records the version shown. The
+thread appends that turn and the live brief, runs the conversational agent at
+low effort with `yield_focus` available, appends the reply, and completes the
+event with the reply as its report. No other loop makes routing decisions, so
+there is no race between them.
 
 Alice sends two more messages while that call is running. Each commit wakes
 the thread. Its next wait returns both wakes in one list, it claims both
-events, and `to_api` merges them into one user message. That is one call, and
-it reads the prefix the previous call cached. `watch` was woken as well, but
+events, and `to_api` merges them into one user message. Neither turn carries
+her profile, since the context already presented it. That is one call, and it
+reads the prefix the previous call cached. `watch` was woken as well, but
 `triage_view` omits events in the live context, so the pass finds nothing
 pending and is skipped.
 
@@ -261,9 +312,12 @@ four events, the last one twenty seconds ago, with no reply owed. It does not
 divert. It assigns the event to the room's context, which is opened now with
 a conversational agent of its own, with a brief stating that the character is
 currently talking to Alice. That is the hold, and the assignment's reason
-records it. Bob gets a reply in about a minute instead of seconds, in the
-character's voice, and the room's agent keeps the exchange in its context.
-The thread was woken by the arrival, found nothing pending in its context,
+records it. If Bob's handle is linked, his profile opens the event turn, since
+this context has presented nobody yet; if it is not, the agent may link him
+during its loop, and his next mention in the room will present it. Bob gets a
+reply in about a minute instead of seconds, in the character's voice, and the
+room's agent keeps the exchange in its context. The thread was woken by the
+arrival, found nothing pending in its context,
 and waited.
 
 Alice writes goodnight. The thread replies and calls `yield_focus`. The tool
@@ -274,7 +328,9 @@ thread's wait would have timed out after `focus_idle_seconds` and released on
 the agent's behalf. In either case the context is no longer live. A message
 from Alice an hour later goes through the same triage pass and the same
 divert, and the thread's first call reads the whole transcript uncached, which
-the report shows.
+the report shows. Her profile is not presented again, because the context
+already holds it; the `<sender>` element from the first turn names the page,
+and the agent can view it if it wants the current version.
 
 Ctrl-C cancels the main task. The thread's `finally` releases and returns any
 claim it did not complete. `watch` shuts down as its own documentation
@@ -291,8 +347,13 @@ context's unfinished claims back to `PENDING` and leaves its completed ones
 alone; a release with everything completed returns nothing; `shift` wakes
 subscribers with `Shifted` after commit and not on rollback; the idle
 heartbeat releases only with nothing pending and no reply owed; a stale focus
-is released on startup. The thread's model call is faked the way
-`test_dispatch` fakes subagents. The scenario above is a test that drives
+is released on startup. For profiles: the first event from a known sender in
+a context carries their profile and the turn records the version; a second
+event from them does not; a batch with two events from one person presents
+the profile once; a one-shot subagent is shown it on every event; a person
+linked after their first event is presented with their next; the thread's
+claims follow the same rule as `assign`. The thread's model loop is faked the
+way `test_dispatch` fakes subagents. The scenario above is a test that drives
 `watch` and the thread with the fixture events and asserts the resulting shift
 history.
 
@@ -303,6 +364,8 @@ cannot use. The thread should meter against it, and triage should be told how
 much is left when it decides whether to divert. Liveness: the lease described
 above. A message between contexts, which the same-person-elsewhere case needs.
 A release tool for triage, for a live context that is holding the thread on a
-conversation not worth answering; the idle timeout covers this for now. And
-whether the thread should run tools of its own; here a conversational agent is
-the same single call as a subagent, and describes what it would send.
+conversation not worth answering; the idle timeout covers this for now.
+Re-presenting a profile whose page has changed since it was shown; the version
+id on the turn makes that a comparison against the page's head, but nothing
+does it yet. And latency from memory tool calls inside the live loop; the
+brief asks for the reply first, and the iteration cap bounds the rest.
