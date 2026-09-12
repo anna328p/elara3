@@ -49,15 +49,18 @@ Both are one query over `events` and `turns`.
 
 Assignment is delivery too. When triage hands events to a context, `assign`
 sets them to `ASSIGNED` with the brief on the action, as now, and wakes the
-runner instead of spawning a task; the runner appends the events and the
-brief and runs the context. That holds for the live context as well: a brief
-handed into a live conversation is turned at its next run, which is how
-triage tells it that the job it was asked about has reported. The dispatcher
-runs only one-shot subagents, the events that belong to no context. So every
-context has one executor, the runner, which holds an in-process
-`asyncio.Lock` per context for the runs it starts in parallel at a heartbeat.
-A pass ends when its decisions are recorded; the reports of context runs
-arrive later, and `attend` prints them as they land.
+runner instead of spawning a task. Whether the runner runs the context at
+once is the priority's second fact, as at `submit`: an immediate event, a
+`nudge` or an `active`, is run now, and a `background` or `async` one waits
+for the context heartbeat with its brief, so many assignments batch into one
+run. The live context is run now regardless, since it is served on every
+arrival; a brief handed into a live conversation is how triage tells it that
+the job it was asked about has reported. The dispatcher runs only one-shot
+subagents, the events that belong to no context. So every context has one
+executor, the runner, which holds an in-process `asyncio.Lock` per context
+for the runs it starts in parallel at a heartbeat. A pass ends when its
+decisions are recorded; the reports of context runs arrive later, and
+`attend` prints them as they land.
 
 ## The conversational agent
 
@@ -194,6 +197,9 @@ class Assigned:
 
     context_id: int
     event_ids: tuple[int, ...]
+    #: The events' priorities, so the runner can tell whether any is immediate
+    #: without a read.
+    priorities: tuple[Priority, ...]
     at: datetime
 
 type Wake = Arrived | Heartbeat | Shifted | Assigned
@@ -218,8 +224,9 @@ An `Arrived` delivered to the live context: run it now. Arrivals during a run
 are turned at the next run, so a burst becomes one call, and `to_api` merges
 them into one user message.
 
-An `Assigned`, the wake `assign` sends, naming the context: run it now,
-whether or not it is live. This is the fourth kind of wake.
+An `Assigned`, the wake `assign` sends: run the context now if it is live or
+any of the events is immediate; otherwise nothing, and the events wait for
+the heartbeat. This is the fourth kind of wake.
 
 A `Shifted`: if the focus moved to a context that owes a call, run it now. The
 previous context is left as it is; anything it owes is served at the heartbeat
@@ -373,11 +380,12 @@ the room's context, opened now with a conversational agent. `watch` runs a
 pass. The block shows Alice's context live with no reply owed and the last
 event twenty seconds ago, and the room's context waiting with Bob's message.
 The pass does not divert. It calls `handle_one_event` on Bob's event with a
-brief saying the character is talking to Alice at the moment; the `Assigned`
-wake has the runner run the room's context now, with Bob's profile opening
-the turn if his handle is linked, and his reply arrives within a minute. Had
-the pass left the event alone, the runner would have run the room's context
-at the next context heartbeat instead.
+brief saying the character is talking to Alice at the moment. The event is
+`active`, so the `Assigned` wake has the runner run the room's context now,
+with Bob's profile opening the turn if his handle is linked, and his reply
+arrives within a minute. Had the pass left the event alone, or had the event
+been `async`, the runner would have run the room's context at the next
+context heartbeat instead.
 
 Alice writes goodnight. Her agent replies and calls `yield_focus`. A
 `RELEASE` attributed to her agent commits, and the `Shifted` makes `watch` run
@@ -400,7 +408,9 @@ out of `triage_view` and `pending_count`; a context with a delivered event
 owes a call, and so does one whose last turn is a user turn; running a context
 appends one turn per delivered event and completes them; `assign` accepts a
 delivered event, wakes the runner with `Assigned`, and spawns nothing for a
-context, including the live one; `assign` with a `context_id` delivers into
+context, including the live one; the runner runs on an `Assigned` only for
+an immediate event or the live context, and a `background` assignment waits
+for the heartbeat; `assign` with a `context_id` delivers into
 that context; a sequence holding a delivered event routes to its context or
 is refused; `defer` refuses a delivered event; `divert_attention` on the live
 context is refused; a
