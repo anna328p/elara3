@@ -2,42 +2,70 @@
 
 A sketch. It describes the finished design, not the decisions behind it, using
 the prototype's terms (`../README.md`): events, streams, contexts, the two
-passes, the wake-ups that `watch` runs on, and the memory and people stores.
+passes, the priorities, the wake-ups that `watch` runs on, and the memory and
+people stores.
 
 ## Context
 
-Realtime priority is currently only a sort key. A message from someone in an
-active conversation waits for a triage pass and then for a subagent call, so
-the reply arrives a minute or more after a message that expected one in
-seconds. The architecture note says realtime events are handled immediately and
-suggests a queue per channel as one option.
+The priorities on `main` are two facts about delivery: whether an event goes to
+triage or to its stream's context, and whether anyone is woken for it.
+`background` and `nudge` go to triage; `async` and `active` go to the context;
+`nudge` and `active` wake their reader now. The README says that until
+contexts can wake on their own, the context-bound events pass through triage
+anyway and are assigned into their context from there.
 
-In this design, at most one context is *live*. Events in the streams that route
-to a live context are handled by a dedicated loop, the thread, without a triage
-call. Triage decides which context is live, using one additional tool in the
-pass it is already running, because triage is the model that sees every urgent
-arrival. While a context is live, triage does not assign into it. Only the
-first message of a conversation waits for a triage pass.
+This design gives contexts their own execution, so that stops. A context-bound
+event is delivered to its context at `submit` and never enters the pending
+set. A runner serves contexts: one of them, the *live* context, on every
+arrival, and the rest at a heartbeat. Triage still gives events to contexts:
+its tools act on delivered events as well as pending ones. It also decides
+which context is live, using one additional tool, and is shown the contexts
+that are waiting so it can decide. Attention can rest on any context, a
+conversation or a task.
 
-Focus names a context. Two streams that share a context are attended together,
-the thread continues with the context's full transcript, and when focus moves
-elsewhere the context remains and triage assigns into it as before. Making a
-context live changes only which loop writes to it.
+## Delivery
+
+`submit` already opens the stream on first sight in the same transaction as
+the event. For a context-bound priority it also resolves the stream's context,
+opening one if needed, sets the event to `ASSIGNED`, and writes a `DELIVERED`
+action with the context's agent as both actor and assignee, since the agent
+received it. The event is never `PENDING`, so it is not in triage's pending
+list, not counted by `pending_count`, and never the sweep's. Triage sees it
+under its context, below, and can act on it there. Its turn is not appended
+yet: turns are the record of what the agent was shown, and an agent whose
+call is in flight has not been shown this event. Whichever executor next runs
+the context appends the turn then.
+
+`ASSIGNED` is a fourth status, set here and by `assign`. `record_failure` sets
+events back to `PENDING` instead of leaving them unchanged, and `Action` gains
+`DELIVERED`. Two concurrent passes were already unsafe without the status.
+
+A context *owes a call* when it has delivered events without a turn, or when
+its last turn is a user turn. The first is a conversation with messages
+unanswered. The second is a tool loop that stopped between iterations: the
+runner on the memory branch stores each tool result before the next request,
+so a context left there ends on a user turn and `to_api` can send it again.
+Both are one query over `events` and `turns`.
+
+A context is run by one executor at a time. The queue holds an in-process
+`asyncio.Lock` per context, taken by whoever runs it: the runner for a live
+or heartbeat run, the dispatcher for a batch assignment. `assign` refuses an
+assignment that would route into the live context, with an error the triage
+model can read.
 
 ## The conversational agent
 
 The prototype mints a subagent for every context. Its system prompt describes a
 task handler: triage hands you events, report back. That framing is wrong for a
-conversation, in batch as well as live, and it would be the identity that live
-replies are attributed to. So the role of a context's agent depends on what the
-context is for.
+conversation, and it would be the identity that live replies are attributed
+to. So the role of a context's agent depends on what the context is for.
 
 ```python
 class AgentRole(StrEnum):
     TRIAGE = "triage"
     SWEEP = "sweep"
     #: The agent of a channel or direct stream's context. It represents the
-    #: character in that one exchange, in batch and live alike.
+    #: character in that one exchange, at a heartbeat and live alike.
     CONVERSATIONAL = "conversational"
     #: A task handler: a job stream's context, or one-shot work.
     SUBAGENT = "subagent"
@@ -48,34 +76,31 @@ and a subagent for a job stream. One-shot assignments still get a subagent. The
 role selects the system prompt, `conversation_system.md.j2` or the existing
 `subagent_system.md.j2`. A context's role never changes, so its cached prefix
 does not change either. The conversational prompt states that the agent
-represents the character in this one exchange, that each new message comes
-with a brief from triage or, when live, with a note that the conversation is
-happening now, and that its report is the text it would send, in the
-character's voice. In the real framework this is the agent that calls the
-personality model's tools.
-
-The thread serves conversational agents only. A job stream therefore cannot be
-made live, and the tool needs no separate check for it.
+represents the character in this one exchange, that messages arrive as turns,
+sometimes with a brief from triage and, when live, with a note that the
+conversation is happening now, and that its report is the text it would send,
+in the character's voice. In the real framework this is the agent that calls
+the personality model's tools.
 
 ## Who is speaking
 
 The memory branch gives the character known people: a name, a root page at
 `/memories/people/<slug>.md`, and handles, one `(venue, username)` per row,
-each belonging to one person. `assign` looks up the senders of a batch in one
-query, and the event turn of a known sender carries a `<sender>` element with
-the person's name, the path of their page, and the page's current text. It does
-this on every event.
+each belonging to one person. It looks up the senders of a batch in one query,
+and the event turn of a known sender carries a `<sender>` element with the
+person's name, the path of their page, and the page's current text, on every
+event.
 
 In a conversational agent's context, a person's profile is presented once: with
 the first event from them in that context, and not with later ones. The
 context keeps every turn, so the agent has already read the profile, and
-repeating it on each message adds tokens to a prefix that would otherwise be
-cached. The same rule applies to batch assignments and to the thread's claims,
-since both append event turns the same way. A one-shot subagent has no context
-to compare against, so it is shown every known sender's profile, as now.
+repeating it adds tokens to a prefix that would otherwise be cached. The rule
+is applied wherever event turns are appended, by the runner and by the
+dispatcher. A one-shot subagent has no context to compare against, so it is
+shown every known sender's profile, as now.
 
 The turn's content stays verbatim: the profile text is pasted into it, because
-the content is the record of what the API was sent and a placeholder filled at
+the content is the record of what the API was sent, and a placeholder filled at
 replay would either pin the version, which gains nothing over the copy, or
 substitute the page's head, which changes the cached prefix and loses what the
 agent saw. What the copy lacks is provenance, and a join table supplies it:
@@ -104,14 +129,14 @@ place, and "already shown in this context" is one query for both. That query
 joins the context's turns to their transclusions, the versions to their
 entries, and the entries to the people whose root page they are.
 
-When events are appended to a context, in `assign` and in the thread, the
-batch's senders are looked up as now, the people already presented in the
-context are subtracted, and within the batch only the first event from each
-remaining person gets the profile. The turn that presents an event opens with
-the `<sender>` element and the `<event>` follows it, so the template moves the
-element ahead of the event. The rule concerns profiles presented, not senders
-seen: a sender who was unknown when they first wrote, and whom the agent later
-links with `link_person`, is presented with their next event.
+When event turns are appended to a context, the batch's senders are looked up
+as now, the people already presented in the context are subtracted, and
+within the batch only the first event from each remaining person gets the
+profile. The turn opens with the `<sender>` element and the `<event>` follows
+it, so the template moves the element ahead of the event. The rule concerns
+profiles presented, not senders seen: a sender who was unknown when they first
+wrote, and whom the agent later links with `link_person`, is presented with
+their next event.
 
 ## The live context
 
@@ -131,20 +156,27 @@ class AttentionRow(Base):
     shift: Mapped[Shift]
     #: The context made live, or None on a release.
     context_id: Mapped[int | None] = mapped_column(ForeignKey("contexts.id"))
-    #: Who decided: the triage agent on a divert; the conversational agent on
-    #: a release, whether it yielded or the thread timed out on its behalf.
+    #: Who decided: the triage agent on a divert; the context's agent on a
+    #: release, whether it yielded, finished, or the runner timed out on its
+    #: behalf.
     agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id"))
     reason: Mapped[str]
 ```
 
+The context a `PREEMPT` took the runner from is the context of the row before
+it. No column marks it; the triage prompt derives it when it lists that
+context, below.
+
 `EventQueue.focus()` returns the current row or `None`. `shift()` appends a row
 and, after the commit, wakes subscribers with a `Shifted`, a third kind of wake
-alongside `Arrived` and `Heartbeat`:
+alongside `Arrived` and `Heartbeat`. `Arrived` gains the context the event was
+delivered to, or `None` when it went to triage, since that is part of why the
+wake fired.
 
 ```python
 @dataclass(frozen=True, slots=True)
 class Shifted:
-    """The focus moved. The thread acts on it; `watch` ignores it."""
+    """The focus moved."""
 
     shift: Shift
     context_id: int | None
@@ -153,233 +185,223 @@ class Shifted:
 type Wake = Arrived | Heartbeat | Shifted
 ```
 
-`due` in the scheduler already counts only arrivals and heartbeats, so `watch`
-needs no change. Nothing else is cached: how long the context has been live,
-how many events the thread has taken and when the last one arrived are queries
-over `attention`, `event_actions` and `events`, one per number, made when the
-triage prompt is rendered.
+## The runner
 
-A context has one writer at a time. While a context is live the thread is its
-writer. `EventQueue.assign` refuses an assignment that would route into the
-live context, with an error the triage model can read ("stream 4 is live; the
-realtime thread has it"), and `triage_view` omits pending events whose stream
-routes there. In the other direction, if a context becomes live while a batch
-assignment into it is still running, the thread makes no call until that
-assignment has reported.
+The runner is a loop in `attention.py`, subscribed to the queue alongside
+`watch`. It runs contexts that owe a call. Running a context means: take its
+lock; append a turn for each delivered event without one, with profiles as
+above, and a brief, `live.md.j2` if the context is live and `heartbeat.md.j2`
+otherwise; run the agent's tool loop as the dispatcher does, storing every
+message; complete the events with the final reply as their report; release the
+lock. A live run uses `live_effort`; a heartbeat run uses `subagent_effort`.
+Both use the agent's tools, `memory` and `link_person`, and a live run of a
+conversational agent also offers `yield_focus(reason)`.
 
-The refusal requires the queue to know which events are being handled, which
-the prototype does not record: an assigned event stays `PENDING` until the
-assignee reports. So `assign` sets a fourth status, `ASSIGNED`, and
-`record_failure` sets the events back to `PENDING` instead of leaving them
-unchanged. `Action` gains `ATTEND` for the thread's claims and `RETURNED` for
-claims given back. Two concurrent passes were already unsafe without this
-status; the thread makes the problem certain to occur.
+The loop waits on its subscription with a timeout, and acts on what it gets:
 
-## Diverting attention
+An `Arrived` delivered to the live context: run it now. Arrivals during a run
+are turned at the next run, so a burst becomes one call, and `to_api` merges
+them into one user message.
 
-Triage gets one more tool.
+A `Shifted`: if the focus moved to a context that owes a call, run it now. The
+previous context is left as it is; anything it owes is served at the heartbeat
+or when attention returns.
 
-`divert_attention(stream_id, reason)` makes the context that the stream routes
-to live, opening a context if the stream has none. It records an `ACQUIRE` if
-nothing was live and a `PREEMPT` otherwise, in which case the thread finishes
-with the previous context as described in the next section. It is refused for
-a stream whose context belongs to a subagent, which means a job stream. Every
-pending event in the diverted stream now belongs to the thread: the dispatcher
-claims them, so a later `handle_one_event` on one of them in the same pass is
-refused the same way a second disposition is, and they are exempt from the
-rule that every event id must appear in exactly one call.
+A `Heartbeat` of `context_heartbeat_seconds`: run every context that owes a
+call and is not live, as parallel tasks, the way the dispatcher runs
+assignments. Async arrivals wait for this, and so does an active arrival that
+triage chose not to divert to.
 
-There is no tool to hold and none to release. A pass holds by seeing the live
-context and assigning elsewhere anyway; the assignment's reason records the
-decision. Release is decided from inside the conversation: the conversational
-agent yields when it judges the exchange over, and the thread times out on its
-behalf when nothing has arrived for `focus_idle_seconds` and no reply is owed.
-Triage can move the thread to another context but cannot stop it.
+After a live run, the runner decides whether the context still holds the
+runner. A subagent's context is released as soon as its loop ends owing
+nothing, since a task that has reported is done. A conversational context is
+released when its agent called `yield_focus`, or when `focus_idle_seconds`
+pass with nothing owed. Each release is a `RELEASE` shift attributed to the
+context's agent, with the reason saying which.
 
-The triage prompt shows the live context in a `<live>` block above its events:
-the titles of its streams, how long it has been live, how many events the
-thread has attended, seconds since the last one, and whether a reply is owed,
-which means the transcript ends on a user turn. The block serves two purposes.
-A pass deciding whether to divert needs to know what the thread is currently
-doing. And a brief to a conversational agent replying elsewhere can state that
-the character is talking to Alice right now, which changes what a good reply
-looks like.
+After any run ends, the runner asks `digest_model` in the background for one
+line saying what the context is doing now, from its last few turns, and stores
+it in `contexts.summary`, following the precedent of `events.digest`: derived,
+absent until written, and the last reply's first line stands in until then.
+The line is written for the triage prompt, below. A failure leaves the old
+line.
 
-The template's guidance is short. Divert when a person is replying within
-seconds, which is usual for a direct stream at realtime priority and unusual
-for a room mention. Do not divert for a single message when a reply is owed in
-the live context; a switch means an uncached first call in the new context and
-a slower answer for the person in the previous one, whose messages are then
-assigned in batch like everything else. When the candidate is the same person
-writing from a second place, assign it into the live context's stream instead.
-That case needs the message between contexts that the prototype does not have.
+On startup, a focus left by a previous run is released. On shutdown, the loop
+releases in a `finally`. The real framework needs a lease here, renewed each
+iteration, so that a dead runner does not keep holding focus; the prototype
+has one process and a `finally`.
 
-## The realtime thread
+## Triage under attention
 
-The thread is a loop over the live context, in `attention.py`, subscribed to
-the queue alongside `watch`. Each iteration:
+Triage's prompt gains a `<contexts>` block above its events, listing the live
+context and every context that owes a call. Each entry gives the context id,
+its streams' titles, its agent's role, its state, its summary line, and for
+each delivered event without a turn, the sender and the description. The
+state is one of: live since a time, with events attended and seconds since the
+last one, and whether a reply is owed; preempted at a time with the reason of
+the shift that took the runner, derived from the attention history; or waiting
+since its oldest unturned delivery. A subagent context that is paused between
+iterations of a loop shows how many iterations it has run.
 
-1. Wait on the subscription. A `Shifted` wake means the focus has moved or
-   gone: finish with the old context (below) and start on the new one. An
-   `Arrived` wake with nothing live requires no action, and the loop waits
-   again without a read.
-2. Claim every pending event whose stream routes to the live context: set it
-   to `ASSIGNED` with an `ATTEND` action attributed to the conversational
-   agent, which is taking the events for itself. All pending events are taken
-   at once, so three messages that arrived during the previous call become one
-   user message; `contexts.to_api` already merges consecutive user turns.
-3. Append the events as turns, each with the sender's profile if this is the
-   person's first presentation in the context, plus one brief, `live.md.j2`:
-   this conversation is happening now; answer what needs answering, say
-   nothing if nothing does, and reply before writing to memory. The brief is a
-   turn and not a change of system prompt, so the cached prefix survives the
-   change of mode.
-4. Run the conversational agent's loop with its usual tools, `memory` and
-   `link_person`, plus `yield_focus(reason)`. Append each message of the loop
-   as the subagent runner does, complete the events with the final reply as
-   their report, and if `yield_focus` was called, record a `RELEASE` shift
-   attributed to that agent.
-5. Repeat. The wait has a timeout of `focus_idle_seconds`, measured from the
-   live context's last event. A `Heartbeat` with nothing pending in the
-   context and no reply owed is also a `RELEASE`, attributed to the same agent,
-   with a reason stating how long the context was idle. Nothing polls: the
-   queue wakes the thread after each commit that could concern it, its reads
-   are idempotent, and a wake caused by an arrival in some other stream costs
-   one query.
+Triage acts on both. Its event tools take delivered events as well as
+pending ones, by the ids the block lists. `handle_one_event` on a delivered
+event runs its context now with the brief, through the dispatcher, instead of
+leaving it for the heartbeat; it is refused when the context is live, since
+the runner has it. `handle_event_sequence` can mix pending and delivered
+events, routed as before, which is how a job's pending result is handed into
+the conversation it answers. `defer_event` takes pending events only: a
+delivered event that triage does not act on is answered at its context's
+heartbeat, which is what deferring it would mean. The rule that every event
+id must appear in exactly one call covers the pending list; delivered events
+are optional to act on.
 
-Finishing with a context sets every event the thread claimed but did not
-complete back to `PENDING` with a `RETURNED` action, so a crash during a call
-leaves nothing stranded past the next start. On startup, a focus left by a
-previous run is released the same way. On shutdown, the loop releases in a
-`finally`. The real framework needs a lease here, renewed each iteration, so
-that a dead thread does not keep holding focus; the prototype has one process
-and a `finally`.
+Triage also gets one more tool. `divert_attention(context_id, reason)` makes
+that context live: an `ACQUIRE` if nothing was live and a `PREEMPT` otherwise.
+It is refused for a context that is already live. There is no tool to hold
+and none to release. A pass holds by seeing the block and not diverting; a
+context is released by its own agent or the runner, as above.
 
-The thread's calls use `realtime_model` and `realtime_effort`, both set low,
-and the same `subagent_max_iterations` cap as batch work. The goal is a reply
-within seconds, and the same agent will continue the same context at higher
-effort when triage next assigns into it.
+The guidance in the template is short. Divert to a conversation when a person
+is replying within seconds, which is usual for a direct stream at `active` and
+unusual for a room mention. Do not divert for a single message when a reply is
+owed in the live context; hand the other person's message to their context
+with a brief instead, or leave it for the heartbeat, since a switch means an
+uncached first call in the new context.
+Divert back to a preempted task when nothing else needs the runner, so the
+task finishes. A task and a conversation are both contexts; the block says
+which is which.
+
+`watch` runs a pass on a heartbeat, on a `nudge`, on an `active` arrival
+delivered to a context that is not live, and on a `RELEASE`. The first two are
+as on `main`. The third is the case where a divert decision is needed; an
+active arrival in the live context needs no decision, and `watch` reads the
+focus to tell them apart. The fourth is so that a paused task, or the next
+conversation waiting, gets the runner without waiting for the heartbeat. A
+pass whose pending set is empty still runs when the wake was an active
+arrival or a release, since the decision it exists for concerns contexts and
+not events, so `watch` skips a pass only on a heartbeat with nothing pending
+and no context owing a call.
 
 ## Config
 
 ```toml
-realtime_model = "claude-sonnet-5"
-realtime_effort = "low"
+live_effort = "low"
+context_heartbeat_seconds = 60
 focus_idle_seconds = 180
 ```
+
+The runner uses `subagent_model` for both kinds of run; the live run differs
+only in effort.
 
 ## Commands
 
 ```sh
-uv run python -m event_prototype attend                 # watch plus the thread, until ^C
+uv run python -m event_prototype attend                 # watch plus the runner, until ^C
 uv run python -m event_prototype attend --play evening  # the same, fed a scripted evening of events
 uv run python -m event_prototype focus                  # the current focus and every shift so far
+uv run python -m event_prototype contexts               # every context owing a call, with its state and summary
 ```
 
-`attend` runs `watch` and the thread in one process. It prints each shift as
-it happens and each of the thread's calls with its cache reads, so a
-preemption shows up as a call with no cache reads. The queue wakes only its
-own process, so an event written from a second terminal would wait for the
-heartbeat. `--play` names a scenario in `fixtures.py`, a timed list of events
-submitted from inside the process while the loops run. That is how the flow
-below is run by hand.
+`attend` runs `watch` and the runner in one process. It prints each shift as
+it happens and each run with its cache reads, so a preemption shows up as a
+call with no cache reads. The queue wakes only its own process, so an event
+written from a second terminal would wait for a heartbeat. `--play` names a
+scenario in `fixtures.py`, a timed list of events submitted from inside the
+process while the loops run. That is how the flow below is run by hand.
 
 ## Execution flow
 
 A scenario, followed through the process. `attend` opens the queue, releases
-any focus left by a previous run, and starts two subscribers: `watch`, which
-runs triage on an urgent arrival and on the heartbeat, and the thread. The
-sweep remains a separate command.
+any focus left by a previous run, and starts two subscribers: `watch` and the
+runner. The sweep remains a separate command.
 
-A nightly backup reports. Its `JobEvent` is committed at `LOW`, and the queue
-wakes both subscribers with `Arrived`. The thread has nothing live and waits
-again without a read. `watch` sees a priority below `urgent_priority` and
-waits for its heartbeat. On the heartbeat, triage assigns the report to the
-backup job's context, whose agent is a subagent, and that subagent reports.
+A research job's context is live. Triage diverted to it at an earlier pass,
+and the runner is partway through the subagent's loop, storing each message
+as it goes. Its summary line says what it is reading.
 
-Alice sends a direct message at `REALTIME`. `watch` starts a triage pass,
-because realtime is urgent. The pass sees one event in a direct stream and
-nothing live, and calls `divert_attention`. `resolve_context` opens a context
-with a conversational agent, the `ACQUIRE` row commits, the dispatcher claims
-Alice's message for the thread, and the queue wakes with `Shifted`. The thread
-reads the focus and claims the message with an `ATTEND`. Alice's handle is
-linked to a known person and nothing has been presented in this new context,
-so the event turn opens with her profile, with a transclusion row naming the
-version shown. The
-thread appends that turn and the live brief, runs the conversational agent at
-low effort with `yield_focus` available, appends the reply, and completes the
-event with the reply as its report. No other loop makes routing decisions, so
-there is no race between them.
+Alice sends a direct message: "hey could i get you to look at something real
+quick?" The ingestion layer submits it at `active`, because a direct message
+is a person in a live exchange. `submit` opens a context for her stream with a
+conversational agent, sets the event to `ASSIGNED` with a `DELIVERED` action,
+and wakes with an `Arrived` naming that context. The runner sees an arrival
+outside the live context and does nothing. `watch` sees an active arrival
+outside the live context and runs a pass. The pass has no pending events. Its
+`<contexts>` block shows the research context, live for twelve minutes and
+mid-loop, and Alice's context, waiting with one delivered event, her handle
+and her message. It calls `divert_attention` on her context. A `PREEMPT`
+commits and a `Shifted` is sent.
 
-Alice sends two more messages while that call is running. Each commit wakes
-the thread. Its next wait returns both wakes in one list, it claims both
-events, and `to_api` merges them into one user message. Neither turn carries
-her profile, since the context already presented it. That is one call, and it
-reads the prefix the previous call cached. `watch` was woken as well, but
-`triage_view` omits events in the live context, so the pass finds nothing
-pending and is skipped.
+The runner finishes the research iteration it is on, which leaves that
+context ending on a user turn of tool results, and reads the new focus. It
+takes Alice's lock, appends her event turn, opening with her profile and a
+transclusion row since this context has presented nobody, appends the live
+brief, and runs her agent at low effort with `yield_focus` available. The
+reply is appended and the event completed.
 
-Bob mentions the character in a room, at `HIGH`. `watch` runs triage. The pass
-sees Bob's event and, in the `<live>` block, that Alice's context has taken
-four events, the last one twenty seconds ago, with no reply owed. It does not
-divert. It assigns the event to the room's context, which is opened now with
-a conversational agent of its own, with a brief stating that the character is
-currently talking to Alice. That is the hold, and the assignment's reason
-records it. If Bob's handle is linked, his profile opens the event turn, since
-this context has presented nobody yet; if it is not, the agent may link him
-during its loop, and his next mention in the room will present it. Bob gets a
-reply in about a minute instead of seconds, in the character's voice, and the
-room's agent keeps the exchange in its context. The thread was woken by the
-arrival, found nothing pending in its context,
-and waited.
+Alice sends two more messages while that run is in flight. Each is delivered
+to her context at `submit` and wakes both subscribers. `watch` reads the focus,
+finds the arrivals are in the live context, and does not run a pass. The
+runner turns both at its next run, merged into one user message, reading the
+prefix the previous run cached. Nothing about these messages reaches triage.
 
-Alice writes goodnight. The thread replies and calls `yield_focus`. The tool
-result is appended, a `RELEASE` attributed to the conversational agent
-commits, `Shifted` is sent, and the thread finishes with the context, which
-has nothing to return. If she had stopped writing without saying so, the
-thread's wait would have timed out after `focus_idle_seconds` and released on
-the agent's behalf. In either case the context is no longer live. A message
-from Alice an hour later goes through the same triage pass and the same
-divert, and the thread's first call reads the whole transcript uncached, which
-the report shows. Her profile is not presented again, because the context
-already holds it; the `<sender>` element from the first turn names the page,
-and the agent can view it if it wants the current version.
+Bob mentions the character in a room, at `active`. The event is delivered to
+the room's context, opened now with a conversational agent. `watch` runs a
+pass. The block shows Alice's context live with no reply owed and the last
+event twenty seconds ago, and the room's context waiting with Bob's message.
+The pass does not divert. It calls `handle_one_event` on Bob's event with a
+brief saying the character is talking to Alice at the moment, and the
+dispatcher runs the room's context now; Bob's profile opens the turn if his
+handle is linked, and his reply arrives within a minute. Had the pass left
+the event alone, the runner would have run the room's context at the next
+context heartbeat instead.
 
-Ctrl-C cancels the main task. The thread's `finally` releases and returns any
-claim it did not complete. `watch` shuts down as its own documentation
-describes.
+Alice writes goodnight. Her agent replies and calls `yield_focus`. A
+`RELEASE` attributed to her agent commits, and the `Shifted` makes `watch` run
+a pass. The block shows the research context preempted twenty minutes ago,
+with the reason of that shift and its summary line, and nothing else owing a
+call. The pass diverts to it. The runner reads the focus, takes the lock, and
+sends the transcript again; the loop continues from the stored tool results,
+uncached, which the report shows. When the loop ends with a report, the
+runner releases the context, and the pass that follows finds nothing to
+divert to.
+
+Ctrl-C cancels the main task. The runner's `finally` releases; `watch` shuts
+down as its own documentation describes.
 
 ## Verification
 
-Tests against the in-memory database, without the API: a claimed event is
-`ASSIGNED` and absent from `triage_view`; `assign` into the live context
-raises; `divert_attention` on a job stream is refused because its agent is a
-subagent; a divert claims the stream's pending events within the pass, so a
-second disposition on one of them is refused; a `PREEMPT` sets the old
-context's unfinished claims back to `PENDING` and leaves its completed ones
-alone; a release with everything completed returns nothing; `shift` wakes
-subscribers with `Shifted` after commit and not on rollback; the idle
-heartbeat releases only with nothing pending and no reply owed; a stale focus
-is released on startup. For profiles: the first event from a known sender in
-a context carries their profile and a transclusion row for the version; a
-second
-event from them does not; a batch with two events from one person presents
-the profile once; a one-shot subagent is shown it on every event; a person
-linked after their first event is presented with their next; the thread's
-claims follow the same rule as `assign`. The thread's model loop is faked the
-way `test_dispatch` fakes subagents. The scenario above is a test that drives
-`watch` and the thread with the fixture events and asserts the resulting shift
-history.
+Tests against the in-memory database, without the API: an `active` or `async`
+submit sets the event to `ASSIGNED` with a `DELIVERED` action and leaves it
+out of `triage_view` and `pending_count`; a context with a delivered event
+owes a call, and so does one whose last turn is a user turn; running a context
+appends one turn per delivered event and completes them; `assign` accepts a
+delivered event and runs its context, and raises for the live context;
+`defer` refuses a delivered event; `divert_attention` on the live context is
+refused; a
+`PREEMPT` leaves the previous context's turns and delivered events as they
+are; a subagent context is released when its loop ends owing nothing; a
+conversational context is released on yield and on the idle timeout, and not
+before; `shift` wakes with `Shifted` after commit and not on rollback; `due`
+is true for an active arrival outside the live context and a release, and
+false for an active arrival inside it; the preempted context is derived from
+the attention history; the first event from a known sender in a context
+carries their profile with a transclusion row, a second does not, a batch with
+two events from one person presents it once, a one-shot subagent is shown it
+on every event, and a person linked after their first event is presented with
+their next. The runner's model loop is faked the way `test_dispatch` fakes
+subagents. The scenario above is a test that drives `watch` and the runner
+with the fixture events and asserts the resulting shift history.
 
 ## Left out
 
-Budget: the architecture reserves realtime quota that the rest of the system
-cannot use. The thread should meter against it, and triage should be told how
-much is left when it decides whether to divert. Liveness: the lease described
-above. A message between contexts, which the same-person-elsewhere case needs.
-A release tool for triage, for a live context that is holding the thread on a
-conversation not worth answering; the idle timeout covers this for now.
-Re-presenting a profile whose page has changed since it was shown; the
-transclusion row makes that a comparison against the page's head, but nothing
-does it yet. And latency from memory tool calls inside the live loop; the
-brief asks for the reply first, and the iteration cap bounds the rest.
+Budget: the architecture reserves quota for live exchanges that the rest of
+the system cannot use. The runner should meter against it, and triage should
+be told how much is left when it decides whether to divert. Liveness: the
+lease described above. A message between contexts, which the same person
+writing from a second place needs. Re-presenting a profile whose page has
+changed since it was shown; the transclusion row makes that a comparison
+against the page's head, but nothing does it yet. And the summary line's
+quality:
+it follows the digest precedent, and whether one line from the last few turns
+describes a task well enough for triage to choose between contexts is
+something the scenario will show.
