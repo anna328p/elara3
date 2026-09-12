@@ -9,17 +9,21 @@ import json
 import logging
 import sys
 import textwrap
+from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from anthropic.lib.tools import ToolError
 
+from .agents import LOOP_ROLES, AgentRole
 from .config import DEFAULT_CONFIG_PATH, Config
 from .contexts import Block
 from .fixtures import seed
+from .heartbeats import Beat
 from .memory import ROOT
 from .queue import EventQueue
 from .render import PromptRenderer
+from .store import utcnow
 
 if TYPE_CHECKING:
     from .runner import PassResult
@@ -59,7 +63,11 @@ def main() -> None:
             help="print the prompt without calling the API",
         )
 
-    sub.add_parser("watch", help="triage on arrival and on the heartbeat, until ^C")
+    sub.add_parser(
+        "watch",
+        help="run each role's pass on its heartbeat, and triage on a nudge or an active arrival, until ^C",
+    )
+    sub.add_parser("heartbeats", help="show the live schedules and when each next fires")
 
     memory_cmd = sub.add_parser("memory", help="read and write the character's memory")
     memory_sub = memory_cmd.add_subparsers(dest="memory_command", required=True)
@@ -127,6 +135,8 @@ async def _dispatch(args: argparse.Namespace, config: Config) -> None:
             await _register(config, args.name, args.notes, args.handle)
         case "link":
             await _link(config, args.venue, args.username, args.name)
+        case "heartbeats":
+            await _heartbeats(config)
         case unknown:  # argparse rejects anything else first
             raise AssertionError(f"unhandled command: {unknown}")
 
@@ -315,34 +325,90 @@ async def _pass(config: Config, which: str, *, dry_run: bool) -> None:
 
 
 async def _watch(config: Config) -> None:
-    """Run triage whenever an immediate arrival lands, and on every heartbeat."""
+    """Run each role's pass on its heartbeat, and triage's on an immediate arrival."""
     renderer = PromptRenderer()
 
     # Imported here for the same reason as in `_pass`.
     from anthropic import AsyncAnthropic
     from dotenv import find_dotenv, load_dotenv
 
-    from .scheduler import watch
+    from .scheduler import OnDue, watch
+    from .sweep import run_sweep
     from .triage import run_triage
 
     load_dotenv(find_dotenv(usecwd=True))
 
     async with await EventQueue.open(config.db_path) as queue, AsyncAnthropic() as client:
 
-        async def on_due() -> None:
-            result = await run_triage(client, config, queue, renderer)
-            if result.considered:
-                _report(result)
+        async def triage_pass(beat: Beat) -> None:
+            _report(await run_triage(client, config, queue, renderer, beat=beat))
 
+        async def sweep_pass(beat: Beat) -> None:
+            _report(await run_sweep(client, config, queue, renderer, beat=beat))
+
+        passes: dict[AgentRole, OnDue] = {
+            AgentRole.TRIAGE: triage_pass,
+            AgentRole.SWEEP: sweep_pass,
+        }
+        on_due: dict[AgentRole, OnDue] = {}
+        for role in LOOP_ROLES:
+            if role not in config.heartbeat_seconds:
+                continue
+            await queue.ensure_standing(role, config.heartbeat_seconds[role])
+            on_due[role] = passes[role]
+
+        rhythm = ", ".join(
+            f"{role.value} every {config.heartbeat_seconds[role]:g}s" for role in on_due
+        )
         print(
-            f"Watching {config.db_path}: triage on a nudge or an active arrival, "
-            f"otherwise every {config.heartbeat_seconds:g}s. ^C to stop."
+            f"Watching {config.db_path}: {rhythm}; triage on a nudge or an active "
+            "arrival. ^C to stop."
         )
-        await watch(
-            queue,
-            heartbeat_seconds=config.heartbeat_seconds,
-            on_due=on_due,
+        await watch(queue, on_due=on_due)
+
+
+async def _heartbeats(config: Config) -> None:
+    async with await EventQueue.open(config.db_path) as queue:
+        summaries = await queue.heartbeats()
+
+    if not summaries:
+        print("Nothing scheduled; `watch` makes the standing schedules when it starts.")
+        return
+
+    now = utcnow()
+    for summary in summaries:
+        schedule = summary.schedule
+        if schedule.interval_seconds is None:
+            rhythm = "once"
+        else:
+            rhythm = f"every {_duration(schedule.interval_seconds)}"
+            if schedule.expires_at is not None:
+                rhythm += f" until {schedule.expires_at.isoformat(timespec='seconds')}"
+        by = schedule.agent.label if schedule.agent else "operator"
+        fired = f"fired {summary.fired}×" if summary.fired else "never fired"
+        print(
+            f"[{schedule.id:>3}] {schedule.role.value:<7} {rhythm:<36} "
+            f"next {summary.next_due.isoformat(timespec='seconds')} "
+            f"({_in(summary.next_due - now)})   {fired}   by {by}"
         )
+        if schedule.message:
+            print(textwrap.indent(textwrap.fill(schedule.message, 80), " " * 12))
+
+
+def _duration(seconds: float) -> str:
+    """Seconds as a person says them: 45s, 5m, 1.5h."""
+    if seconds < 60:
+        return f"{seconds:g}s"
+    if seconds < 3600:
+        return f"{seconds / 60:g}m"
+    return f"{seconds / 3600:g}h"
+
+
+def _in(delta: timedelta) -> str:
+    seconds = delta.total_seconds()
+    if seconds <= 0:
+        return "due"
+    return f"in {_duration(seconds)}"
 
 
 def _plural(count: int, noun: str) -> str:
@@ -359,10 +425,20 @@ def _show_usage(spend: Spend) -> str:
 
 def _report(result: PassResult) -> None:
     considered, dispositions = result.considered, result.dispositions
+    if not considered and not result.check_ins:
+        return
     print(
         f"\n{result.agent.label} considered {_plural(len(considered), 'event')} "
         f"and reached {_plural(len(dispositions), 'disposition')}.\n"
     )
+
+    if result.check_ins:
+        print(f"Woken with {_plural(len(result.check_ins), 'check-in')}:")
+        for note in result.check_ins:
+            by = note.left_by.label if note.left_by else "operator"
+            due = note.due_at.isoformat(timespec="seconds")
+            print(f"    [{by}, due {due}] {note.message}")
+        print()
 
     for disposition in dispositions:
         listed = ", ".join(str(i) for i in disposition.event_ids)
@@ -382,6 +458,19 @@ def _report(result: PassResult) -> None:
 
     if missed := [row.id for row in considered if row.id not in result.dispatched_ids]:
         print(f"Left without a disposition: {missed}")
+
+    for summary in result.scheduled:
+        schedule = summary.schedule
+        when = summary.next_due.isoformat(timespec="seconds")
+        if schedule.interval_seconds is None:
+            print(f"Scheduled a check-in for {schedule.role.value} at {when}:")
+        else:
+            until = schedule.expires_at.isoformat(timespec="seconds") if schedule.expires_at else "ever"
+            print(
+                f"Scheduled {schedule.role.value} every "
+                f"{_duration(schedule.interval_seconds)} until {until}, first at {when}:"
+            )
+        print(textwrap.indent(textwrap.fill(schedule.message or "", 80), "    "))
 
 
 if __name__ == "__main__":

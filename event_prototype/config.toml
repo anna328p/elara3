@@ -12,10 +12,14 @@ db_path = "events.db"
 subagent_effort = "medium"
 sweep_effort = "high"
 
-# `watch` runs triage the moment a nudge or an active event arrives; background
-# and async events wait for this heartbeat.
-heartbeat_seconds = 300
-
 # A subagent's tool loop: this many model calls per assignment at most, the
 # memory tool's reads and edits included, before it is stopped.
 subagent_max_iterations = 8
+
+# Each role's pass runs this often, timed from its last pass. A check-in or an
+# override brings a pass forward, as a nudge or an active arrival does for
+# triage, and the rhythm restarts from it. Last in the file: every key after a
+# table header belongs to it.
+[heartbeat_seconds]
+triage = 300
+sweep = 3600

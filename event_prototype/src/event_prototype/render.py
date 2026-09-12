@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 
 from jinja2 import Environment, PackageLoader, StrictUndefined
 
+from .heartbeats import CheckIn
 from .store import ActionRow, EventRow, utcnow
 
 
@@ -94,6 +95,25 @@ class EventView:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class CheckInView:
+    """A note a pass was woken with, flattened for a template."""
+
+    message: str
+    left_by: str
+    left_at: str
+    age: str
+
+    @classmethod
+    def of(cls, check_in: CheckIn, now: datetime) -> CheckInView:
+        return cls(
+            message=check_in.message,
+            left_by=check_in.left_by.label if check_in.left_by else "the operator",
+            left_at=check_in.left_at.isoformat(timespec="seconds"),
+            age=_humanize(now - check_in.left_at),
+        )
+
+
 def _humanize(delta: timedelta) -> str:
     seconds = int(delta.total_seconds())
     if seconds < 0:
@@ -124,12 +144,16 @@ class PromptRenderer:
         pending: Sequence[EventRow],
         deferred: Sequence[EventRow] = (),
         *,
+        check_ins: Sequence[CheckIn] = (),
+        next_due: datetime | None = None,
         now: datetime | None = None,
     ) -> str:
         now = now or utcnow()
         return self._env.get_template("triage.md.j2").render(
             events=[EventView.of(row, now) for row in pending],
             deferred=[EventView.of(row, now) for row in deferred],
+            check_ins=[CheckInView.of(note, now) for note in check_ins],
+            next_due=next_due.isoformat(timespec="seconds") if next_due else None,
             now=now.isoformat(timespec="seconds"),
         )
 
@@ -144,11 +168,15 @@ class PromptRenderer:
         rows: Sequence[EventRow],
         history: Mapping[int, Sequence[ActionRow]],
         *,
+        check_ins: Sequence[CheckIn] = (),
+        next_due: datetime | None = None,
         now: datetime | None = None,
     ) -> str:
         now = now or utcnow()
         return self._env.get_template("sweep.md.j2").render(
             events=[EventView.of(row, now, history.get(row.id, ())) for row in rows],
+            check_ins=[CheckInView.of(note, now) for note in check_ins],
+            next_due=next_due.isoformat(timespec="seconds") if next_due else None,
             now=now.isoformat(timespec="seconds"),
         )
 

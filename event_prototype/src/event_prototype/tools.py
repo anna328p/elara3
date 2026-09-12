@@ -15,6 +15,7 @@ import asyncio
 from collections.abc import AsyncGenerator, Coroutine, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta
 from typing import Any, cast
 
 from anthropic import AsyncAnthropic
@@ -30,9 +31,10 @@ from .digest import summarize
 from .events import Priority, PriorityName
 from .memory import MemoryTool
 from .people import PeopleStore
+from .heartbeats import HeartbeatSummary
 from .queue import Assignment, EventQueue
 from .render import PersonView, PromptRenderer
-from .store import Action, EventRow
+from .store import Action, EventRow, utcnow
 from .subagent import Spend, Step, SubagentTool, report_of, run_subagent
 
 
@@ -86,6 +88,9 @@ class Dispatcher:
     agent: Agent
 
     dispositions: list[Disposition] = field(default_factory=lambda: [], init=False)
+    #: The schedules this pass wrote, for the report. The durable record is
+    #: `heartbeats`.
+    scheduled: list[HeartbeatSummary] = field(default_factory=lambda: [], init=False)
     _tasks: set[asyncio.Task[None]] = field(default_factory=lambda: set(), init=False, repr=False)
     #: What each event has already been given this pass, so it cannot be
     #: given a second, contradictory one.
@@ -146,6 +151,57 @@ class Dispatcher:
         await self.queue.keep_deferred(event_id, agent=self.agent, reason=reason)
         self._record(Action.KEEP_DEFERRED, event_id, reason)
         self._spawn(self._write_digest(event_id, reason))
+
+    # -- the caller's own schedule --------------------------------------
+    #
+    # Both write for `self.agent.role`, the pass that is running, and are
+    # attributed to its agent. Errors are written for the model to read, as
+    # `_claim`'s is.
+
+    async def schedule_check_in(self, minutes: float, message: str) -> HeartbeatSummary:
+        """A one-shot heartbeat for the calling role, `minutes` from now."""
+        if minutes <= 0:
+            raise ValueError(f"A check-in must be in the future; {minutes!r} minutes is not.")
+        if not message.strip():
+            raise ValueError("A check-in needs a message: what to look at when it fires.")
+        summary = await self.queue.schedule_heartbeat(
+            self.agent.role,
+            due_at=utcnow() + timedelta(minutes=minutes),
+            message=message.strip(),
+            created_by=self.agent,
+        )
+        self.scheduled.append(summary)
+        return summary
+
+    async def set_heartbeat_interval(
+        self, minutes: float, for_minutes: float, reason: str, *, everyone: bool = False
+    ) -> list[HeartbeatSummary]:
+        """A recurring override — for the calling role, or one per role with a
+        heartbeat — lapsing `for_minutes` from now."""
+        if minutes <= 0:
+            raise ValueError(f"An interval must be positive; {minutes!r} minutes is not.")
+        if for_minutes < minutes:
+            raise ValueError(
+                f"An interval of {minutes:g} minutes could not fire once within "
+                f"{for_minutes:g} minutes; make for_minutes at least the interval."
+            )
+        if not reason.strip():
+            raise ValueError("An override needs a reason: it is shown to the passes it wakes.")
+        roles = tuple(self.config.heartbeat_seconds) if everyone else (self.agent.role,)
+        now = utcnow()
+        summaries = [
+            await self.queue.schedule_heartbeat(
+                role,
+                due_at=now + timedelta(minutes=minutes),
+                interval_seconds=minutes * 60,
+                message=reason.strip(),
+                expires_at=now + timedelta(minutes=for_minutes),
+                created_by=self.agent,
+            )
+            for role in roles
+        ]
+        self.scheduled.extend(summaries)
+        return summaries
 
     async def _write_digest(self, event_id: int, reason: str) -> None:
         """Refresh the line triage will see for a newly set-aside event.
@@ -381,6 +437,7 @@ def build_triage_server(dispatcher: Dispatcher) -> MCPServer:
         await dispatcher.defer(event_id, reason)
         return f"Event {event_id} deferred."
 
+    _add_schedule_tools(server, dispatcher)
     return server
 
 
@@ -454,4 +511,62 @@ def build_sweep_server(dispatcher: Dispatcher) -> MCPServer:
         await dispatcher.keep_deferred(event_id, reason)
         return f"Event {event_id} left deferred."
 
+    _add_schedule_tools(server, dispatcher)
     return server
+
+
+def _add_schedule_tools(server: MCPServer, dispatcher: Dispatcher) -> None:
+    """The two tools that act on the caller's own schedule rather than on
+    events. Both passes get them, since either may be waiting on something."""
+
+    @server.tool(name="schedule_check_in")
+    async def _schedule_check_in(minutes: float, message: str) -> str:
+        """Ask for another pass in `minutes`, with a note about what to look at then.
+
+        Use when something is expected — a reply, a job finishing, a deadline —
+        and the next scheduled pass (shown in your prompt) is too far off. The
+        pass that gets the note is a fresh agent: it sees the queue as it stands
+        then and your note, and nothing else from this pass, so the note must
+        stand on its own. A check-in fires once. It counts as a pass, so the
+        regular schedule is timed from it.
+
+        Args:
+            minutes: How long from now. Fractions are fine.
+            message: What to check and why, complete in itself.
+        """
+        summary = await dispatcher.schedule_check_in(minutes, message)
+        return f"Check-in {summary.schedule.id} scheduled for {_when(summary.next_due)}."
+
+    @server.tool(name="set_heartbeat_interval")
+    async def _set_heartbeat_interval(
+        minutes: float, for_minutes: float, reason: str, everyone: bool = False
+    ) -> str:
+        """For a while, run passes every `minutes` on top of the standing schedule.
+
+        Use when activity is high and will stay so — a live conversation, a job
+        reporting in steps — or, with a long interval, when nothing is expected
+        for hours. The override lapses on its own after `for_minutes`, once its
+        next pass would fall past it; nothing has to undo it. Every pass
+        re-times every schedule for its role, so the standing one waits while
+        this runs.
+
+        Args:
+            minutes: Time between passes while the override holds.
+            for_minutes: How long from now it holds. At least `minutes`.
+            reason: Why, shown to the passes it wakes.
+            everyone: Apply it to every role with a heartbeat, not only your own.
+        """
+        summaries = await dispatcher.set_heartbeat_interval(
+            minutes, for_minutes, reason, everyone=everyone
+        )
+        listed = ", ".join(
+            f"{s.schedule.role.value} (schedule {s.schedule.id})" for s in summaries
+        )
+        return (
+            f"Every {minutes:g} minutes for {for_minutes:g} minutes for {listed}; "
+            f"first at {_when(summaries[0].next_due)}."
+        )
+
+
+def _when(at: datetime) -> str:
+    return at.isoformat(timespec="seconds")

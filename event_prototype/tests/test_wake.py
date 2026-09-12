@@ -5,7 +5,8 @@ from __future__ import annotations
 from event_prototype.agents import Agent, AgentRole
 from event_prototype.events import Priority
 from event_prototype.queue import EventQueue
-from event_prototype.wake import Arrival, Arrived, Heartbeat, Wake
+from event_prototype.store import utcnow
+from event_prototype.wake import Arrival, Arrived, Elapsed, Wake
 
 from conftest import message
 
@@ -38,7 +39,7 @@ async def test_arrivals_before_one_wait_come_back_together_in_order(
     assert [wake.event_id for wake in arrivals(wakes)] == ids
     assert len(wakes) == 3
     # Nothing else arrived, so the second wait is the timeout.
-    assert isinstance(after, Heartbeat)
+    assert isinstance(after, Elapsed)
 
 
 async def test_an_escalation_wakes_with_the_new_priority(
@@ -70,7 +71,7 @@ async def test_leaving_the_pending_set_wakes_nobody(queue: EventQueue, triage: A
 
         (wake,) = await subscription.wait(timeout=0)
 
-    assert isinstance(wake, Heartbeat)
+    assert isinstance(wake, Elapsed)
 
 
 async def test_a_subscription_ends_with_its_block(queue: EventQueue) -> None:
@@ -81,18 +82,15 @@ async def test_a_subscription_ends_with_its_block(queue: EventQueue) -> None:
     await queue.submit(message())
 
     (wake,) = await subscription.wait(timeout=0)
-    assert isinstance(wake, Heartbeat)
+    assert isinstance(wake, Elapsed)
 
 
-async def test_pending_count_is_what_triage_would_see(queue: EventQueue, triage: Agent) -> None:
-    assert await queue.pending_count() == 0
+async def test_writing_a_schedule_wakes_nobody(queue: EventQueue, triage: Agent) -> None:
+    async with queue.subscribe("test") as subscription:
+        await queue.ensure_standing(AgentRole.TRIAGE, 300)
+        await queue.schedule_heartbeat(AgentRole.TRIAGE, due_at=utcnow(), message="now")
+        await queue.beat(AgentRole.TRIAGE, at=utcnow())
 
-    kept, deferred, done, gone = [await queue.submit(message(f"m{i}")) for i in range(4)]
-    subagent = await queue.spawn(AgentRole.SUBAGENT)
-    await queue.defer([(deferred, "later")], agent=triage)
-    await queue.complete([done], agent=subagent, report="done")
-    await queue.archive(gone, agent=triage, reason="noise")
+        (wake,) = await subscription.wait(timeout=0)
 
-    assert await queue.pending_count() == 1
-    (row,) = [row for row in await queue.list_events() if row.id == kept]
-    assert row.id == kept
+    assert isinstance(wake, Elapsed)

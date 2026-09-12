@@ -18,7 +18,8 @@ uv run python -m event_prototype triage --dry-run   # the prompt, no API call
 uv run python -m event_prototype triage             # the real thing
 uv run python -m event_prototype sweep              # reconsider the backlog
 uv run python -m event_prototype context 1      # the conversation stream 1 routes to
-uv run python -m event_prototype watch          # triage on arrival and on the heartbeat, until ^C
+uv run python -m event_prototype watch          # each pass on its heartbeat, triage on a nudge or an active arrival, until ^C
+uv run python -m event_prototype heartbeats     # the live schedules and when each next fires
 
 uv run python -m event_prototype memory ls      # the memory directory, as the tool shows it
 uv run python -m event_prototype memory cat /memories/people/mira.md
@@ -30,8 +31,8 @@ echo "# Notes" | uv run python -m event_prototype memory put /memories/notes.md 
 ```
 
 The live passes need `ANTHROPIC_API_KEY`, read from the `.env` at the repo root.
-Models, efforts, the subagent's iteration cap and the database path are set in
-`config.toml`.
+Models, efforts, the subagent's iteration cap, the database path and each role's
+heartbeat are set in `config.toml`.
 
 ## Two passes
 
@@ -59,9 +60,9 @@ poor substitute; it stands in only until a line has been written. Generation is
 spawned in the background and drained with the subagents, so no pass waits on
 it, and a failure just leaves the previous line standing.
 
-**Deferred** is the sweep's. `sweep` runs on a schedule or in idle time with
-nobody waiting, sees the backlog in full with each event's complete history, and
-has the dispositions that triage should not be making in a hurry:
+**Deferred** is the sweep's. `sweep` runs on its own heartbeat with nobody
+waiting, sees the backlog in full with each event's complete history, and has
+the dispositions that triage should not be making in a hurry:
 
 - `escalate_event` — this does need doing; set the priority it should have had and return it to the pending set
 - `handle_event` — needs work now, and is self-contained enough to dispatch directly
@@ -196,7 +197,8 @@ changes.
 
 A pass is a decision about what is pending, so something has to decide when to
 make one. `watch` does: it runs triage the moment an immediate event arrives, a
-nudge or an active one, and otherwise every `heartbeat_seconds`, until ^C.
+nudge or an active one, and otherwise runs each pass on its heartbeat (next
+section), until ^C.
 
 Underneath is a subscription on the queue, `EventQueue.subscribe(label)`. A
 subscription is a wake-up and nothing more: no filter, and no copy of the event.
@@ -204,18 +206,19 @@ The store is the truth and every consumer's read is idempotent, so all the queue
 has to say is that the pending set grew, and the consumer reads whatever it
 needs. What a wake does carry is why it fired. It is one of two records:
 `Arrived`, with the event's id, its priority and whether it was submitted or
-escalated back from the backlog; and `Heartbeat`, which is what a subscriber
-gets when the time it asked to wait for ran out. The scheduler decides from that
-alone. Its one read is a count of pending events, made before it runs a pass so
-that an idle heartbeat does not mint a triage agent for nothing.
+escalated back from the backlog; and `Elapsed`, which is what a subscriber gets
+when the time it asked to wait for ran out. An arrival the scheduler acts on at
+once needs no read; an elapsed wait means the schedule is worth reading, and
+says nothing about which role it was for.
 
 Only `submit` and `escalate` wake, because those are the two ways an event
 enters the pending set, and each does so after its transaction has committed, so
-a write that rolls back wakes nobody. Wakes coalesce: everything that arrived
-since the subscriber last looked comes back as one list, so a burst of messages
-is one pass, and an arrival that lands while a pass is running is waiting when
-the pass ends. The heartbeat is timed from the last pass rather than the last
-wake, so a trickle of heartbeat-bound arrivals cannot postpone it.
+a write that rolls back wakes nobody. Writing a heartbeat wakes nobody either: a
+schedule is only ever written from inside a pass, and the loop re-reads the
+schedule when the pass ends. Wakes coalesce: everything that arrived since the
+subscriber last looked comes back as one list, so a burst of messages is one
+pass, and an arrival that lands while a pass is running is waiting when the
+pass ends.
 
 The label is free text naming the subscriber and what it does with the wake, in
 the spirit of the reason every action carries; `subscriptions()` lists them, and
@@ -268,6 +271,58 @@ later — is attributed to nobody, which the store spells as a NULL agent and th
 CLI prints as "operator". `memory ls`, `cat` and `log` read; `people` and
 `link` do the same for people.
 
+## Heartbeats
+
+Each of the two loop-driven roles, triage and the sweep, has a rhythm of its
+own, and the rhythm lives in the database rather than in the process. A
+**heartbeat** is a row in `heartbeats` saying which role gets a pass, on what
+interval, until when, and with what note; one primitive covers three things.
+Recurring with no end and no note, it is the standing schedule, which `watch`
+declares from `[heartbeat_seconds]` in `config.toml` when it starts. Recurring
+with an end, it is a temporary override: "every five minutes for the next
+hour". With a note and no interval, it is a one-shot check-in: "see if they've
+messaged back". A row is never edited; a changed interval in the config shows
+up as one schedule ended and another begun.
+
+When a schedule next fires is a **tick** in `heartbeat_ticks`, and ticks are
+append-only: a schedule is live while it has an unfired tick, has at most one
+(the index says so), and firing a tick stamps it and inserts the successor in
+the same transaction. So the history of when each beat was due and when it was
+served is kept, not overwritten, and `heartbeats` shows every live schedule
+with its next due time and how often it has fired.
+
+The rule that ties them together is `beat`. A pass for a role, whatever caused
+it, serves every schedule of that role: every tick that has come due fires and
+its note goes into the pass's prompt, and every recurring schedule, due or not,
+has its tick fired and a successor placed one interval after the pass. That is
+what "the whole schedule shifts back" means: a nudge at time *t*
+runs triage at once, and its standing beat is next due at *t* plus the
+interval, not where it was. A check-in is consumed only when its time comes,
+and its firing is itself a pass, so it re-times the rest the same way. An
+override ends on its own, when the successor it would place falls past its
+expiry. A tick fired before it was due is the record of a shift.
+
+`watch` is the loop over that. Its one read of the schedule serves twice: how
+long to sleep, and, on waking, which roles came due. It beats each due role,
+runs the role's pass with what the beat found, and re-reads. A pass is skipped
+when there is nothing for it to see, because a pass mints its agent before it
+looks and an idle beat should not leave one behind; a check-in is itself
+something to attend to, so it runs the pass even over an empty queue. There is
+no startup special case: a fresh standing schedule is due at once, a restart
+with the same config resumes the rhythm where it left off, and a tick that came
+due while the process was down fires once, not once per missed beat.
+
+A pass can act on its own schedule with two tools, available to triage and the
+sweep alike. `schedule_check_in` asks for a pass in so many minutes with a note
+to itself, for when something is expected sooner than the next scheduled pass:
+a reply, a job finishing. `set_heartbeat_interval` adds a recurring override
+for a while, for the calling role or, with `everyone`, for every role with a
+heartbeat; nothing has to undo it. Both rows are attributed to the agent that
+wrote them, so a triage agent that speeds up the sweep is on record as having
+done so, and the prompt shows a check-in with who left it and when. The prompt
+also says when the next scheduled pass is, so the model can judge whether a
+check-in is worth it.
+
 ## Shape of the code
 
 | module | what it holds |
@@ -276,8 +331,8 @@ CLI prints as "operator". `memory ls`, `cat` and `log` read; `people` and
 | `agents.py` | agent identity: the role and UUID of a row the store mints when an agent starts |
 | `streams.py` | stream identity: the kind of locus, its key and its label |
 | `contexts.py` | a turn, and the transform from a transcript to an API message list |
-| `store.py` | the ten SQLAlchemy rows, the resolvers and the spawner, and engine setup |
-| `queue.py` | `EventQueue`: submit, edit, the dispositions, the two views, and the memory and people stores |
+| `store.py` | the twelve SQLAlchemy rows, the resolvers and the spawner, and engine setup |
+| `queue.py` | `EventQueue`: submit, edit, the dispositions, the two views, the heartbeats, and the memory and people stores |
 | `memory.py` | pages as versions, the listing query, and the memory tool's six commands over them |
 | `people.py` | known people: handles, profile pages, and the senders behind a batch of events |
 | `render.py` + `templates/` | rows → prompts |
@@ -286,7 +341,8 @@ CLI prints as "operator". `memory ls`, `cat` and `log` read; `people` and
 | `triage.py` / `sweep.py` | the two passes, tying the above together |
 | `subagent.py` | the tool loop that handles assigned events, one message at a time |
 | `wake.py` | a subscription: the two records a wake can be, and the notifier the queue owns |
-| `scheduler.py` | `watch`: when a triage pass should happen |
+| `heartbeats.py` | what a beat hands a pass: the check-ins, the beat, and a schedule's summary |
+| `scheduler.py` | `watch`: when each role's pass should happen |
 | `digest.py` | the model call that writes an event's backlog line |
 
 Nothing here holds global state: the queue owns its engine, the tools close over
@@ -341,6 +397,12 @@ rows with the `sqlite3` shell bypasses all this — the shell does not enforce
 foreign keys unless told — which is why the CLI can write memory: so there is no
 reason to.
 
+`heartbeats` holds each schedule as it was written, attributed to the agent
+that wrote it or to nobody for the loop's own, and `heartbeat_ticks` the
+append-only record of when each was due and when it fired. A schedule ends by
+firing its last tick without a successor, never by a flag on the row, so the
+live set is a query and the history is complete.
+
 Reads are indexed on `(event_id, timestamp)` and never go per-event. Triage is a
 single query, since the digest needs no history at all; the sweep is two, one for
 the events and one for the whole slice of actions they point at, however large the
@@ -361,9 +423,10 @@ dreams; the model finds things by reading the index and the directory, and a
 person is only ever found by a handle that was linked. Contexts only grow: there
 is no collapse or compaction, and no
 message from one context to another, so a cross-stream assignment still goes to
-a subagent that remembers nothing. `watch` decides when triage happens, but
-the sweep is still a command you run rather than something that fires on idle
-time or a backlog threshold. The queue wakes only subscribers in its own
+a subagent that remembers nothing. Subagents have no heartbeat and no tool to
+ask for one; only the two passes do. A manual `triage` or `sweep` is not a
+beat: it runs in another process, could not wake the loop, and sees no
+check-ins. The queue wakes only subscribers in its own
 process, so an event written from another terminal waits for the heartbeat. No
 token budgets, and no subagent-of-a-subagent — those come with the real
 framework.

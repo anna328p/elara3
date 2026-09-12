@@ -20,6 +20,12 @@ class AgentRole(StrEnum):
     SUBAGENT = "subagent"
 
 
+#: The roles a loop drives. Each has a pass, so each has a heartbeat; a
+#: subagent runs when handed work, never on a clock. Written once here so the
+#: config, the `everyone` of the schedule tools and `watch` cannot disagree.
+LOOP_ROLES: tuple[AgentRole, ...] = (AgentRole.TRIAGE, AgentRole.SWEEP)
+
+
 @dataclass(frozen=True, slots=True)
 class Agent:
     role: AgentRole

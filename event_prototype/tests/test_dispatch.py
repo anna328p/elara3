@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
+from mcp import Client
 
 from event_prototype.agents import AgentRole
 from event_prototype.config import Config
@@ -12,7 +14,7 @@ from event_prototype.events import JobEvent, Priority, ScheduledEvent
 from event_prototype.queue import EventQueue
 from event_prototype.render import PromptRenderer
 from event_prototype.store import Action, Status, utcnow
-from event_prototype.tools import Dispatcher
+from event_prototype.tools import Dispatcher, build_sweep_server, build_triage_server
 
 from conftest import FakeMessages, message
 
@@ -157,3 +159,71 @@ async def test_separate_passes_may_revisit_the_same_event(queue: EventQueue) -> 
     # Archived events are no longer addressable, so look in the full listing.
     (row,) = await queue.list_events(active_only=False)
     assert row.archived_at is not None
+
+
+async def test_a_check_in_is_written_for_the_calling_role_by_the_pass_agent(
+    queue: EventQueue,
+) -> None:
+    sweeper = await dispatcher(queue, AgentRole.SWEEP)
+    before = utcnow()
+
+    summary = await sweeper.schedule_check_in(5, "  see whether the render job reported  ")
+
+    schedule = summary.schedule
+    assert schedule.role is AgentRole.SWEEP
+    assert schedule.created_by == sweeper.agent.id
+    assert schedule.agent == sweeper.agent
+    assert schedule.interval_seconds is None
+    assert schedule.message == "see whether the render job reported"
+    assert timedelta(minutes=5) <= summary.next_due - before < timedelta(minutes=5, seconds=1)
+    assert sweeper.scheduled == [summary]
+
+
+async def test_an_interval_override_is_attributed_and_expires(queue: EventQueue) -> None:
+    triage = await dispatcher(queue)
+    before = utcnow()
+
+    (summary,) = await triage.set_heartbeat_interval(5, 60, "live conversation with mira")
+
+    schedule = summary.schedule
+    assert schedule.role is AgentRole.TRIAGE
+    assert schedule.created_by == triage.agent.id
+    assert schedule.interval_seconds == 300
+    assert schedule.message == "live conversation with mira"
+    assert schedule.expires_at is not None
+    assert timedelta(minutes=60) <= schedule.expires_at - before < timedelta(minutes=60, seconds=1)
+    assert timedelta(minutes=5) <= summary.next_due - before < timedelta(minutes=5, seconds=1)
+
+
+async def test_everyone_expands_to_every_role_with_a_heartbeat(queue: EventQueue) -> None:
+    triage = await dispatcher(queue)
+
+    summaries = await triage.set_heartbeat_interval(5, 60, "busy hour", everyone=True)
+
+    assert [s.schedule.role for s in summaries] == list(Config().heartbeat_seconds)
+    # A triage agent wrote the sweep's row; the attribution says so.
+    assert all(s.schedule.created_by == triage.agent.id for s in summaries)
+    assert len(await queue.heartbeats()) == len(summaries)
+
+
+async def test_an_override_that_could_never_fire_is_refused(queue: EventQueue) -> None:
+    triage = await dispatcher(queue)
+
+    with pytest.raises(ValueError, match="could not fire once"):
+        await triage.set_heartbeat_interval(10, 5, "too short")
+    with pytest.raises(ValueError, match="must be positive"):
+        await triage.set_heartbeat_interval(0, 5, "no interval")
+    with pytest.raises(ValueError, match="in the future"):
+        await triage.schedule_check_in(0, "now")
+    with pytest.raises(ValueError, match="needs a message"):
+        await triage.schedule_check_in(5, "   ")
+
+    assert await queue.heartbeats() == []
+
+
+async def test_the_schedule_tools_are_on_both_tool_sets(queue: EventQueue) -> None:
+    triage = await dispatcher(queue)
+    for build in (build_triage_server, build_sweep_server):
+        async with Client(build(triage)) as mcp:
+            names = {tool.name for tool in (await mcp.list_tools()).tools}
+        assert {"schedule_check_in", "set_heartbeat_interval"} <= names

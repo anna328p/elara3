@@ -3,8 +3,8 @@
 A subscription is a labelled, coalescing wake-up. It carries no filter: the
 store is the truth and every consumer's read is idempotent, so all a wake needs
 to say is that there is something new to read. What it does carry is why it
-fired, so a consumer can tell an arrival from an escalation from the heartbeat
-and act on the priority without a read.
+fired, so a consumer can tell an arrival from an escalation from an elapsed
+wait and act on the priority without a read.
 
 The queue owns one `Notifier` and wakes it after its own commits; nothing here
 is global, and nothing polls. One process is assumed throughout.
@@ -40,13 +40,17 @@ class Arrived:
 
 
 @dataclass(frozen=True, slots=True)
-class Heartbeat:
-    """Nothing arrived; the time a subscriber asked to wait for ran out."""
+class Elapsed:
+    """Nothing arrived; the time a subscriber asked to wait for ran out.
+
+    What that means is the subscriber's to read — the schedule it was waiting
+    on lives in the store, and the wake carries no copy of it.
+    """
 
     at: datetime
 
 
-type Wake = Arrived | Heartbeat
+type Wake = Arrived | Elapsed
 
 
 class Subscription:
@@ -69,7 +73,7 @@ class Subscription:
         self._flag.set()
 
     async def wait(self, timeout: float | None = None) -> list[Wake]:
-        """Everything that arrived since the last wait, or a `Heartbeat` if
+        """Everything that arrived since the last wait, or an `Elapsed` if
         `timeout` ran out first.
 
         The accumulated list is taken and the flag cleared here, before the
@@ -80,7 +84,7 @@ class Subscription:
             async with asyncio.timeout(timeout):
                 await self._flag.wait()
         except TimeoutError:
-            return [Heartbeat(utcnow())]
+            return [Elapsed(utcnow())]
         self._flag.clear()
         arrived, self._arrived = self._arrived, []
         return list(arrived)

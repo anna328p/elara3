@@ -3,8 +3,21 @@ by triage, some of them repeatedly. Triage decides what needs attention now and
 has to be quick about it; you are the pass that decides what these are actually
 worth, with the whole history in front of you and no one waiting on you.
 
-The current time is {{ now }}. There are {{ events | length }} deferred events,
-most urgent first. Each carries the actions taken on it so far.
+The current time is {{ now }}.{% if next_due %} Your next scheduled pass is at {{ next_due }}.{% endif %}
+{% if check_ins %}
+
+Notes left for this pass by earlier ones. Each is a reason this pass is running;
+act on it as you would on an event, then go on to the backlog.
+
+<check_ins>
+{% for note in check_ins %}
+- {{ note.left_by }}, {{ note.age }} ({{ note.left_at }}): {{ note.message }}
+{% endfor %}
+</check_ins>
+{% endif %}
+
+There are {{ events | length }} deferred events, most urgent first. Each carries
+the actions taken on it so far.
 
 {% for event in events %}
 <event id="{{ event.id }}" kind="{{ event.kind }}" priority="{{ event.priority }}"{% if event.stream %} stream="{{ event.stream }}"{% endif %}>
@@ -34,6 +47,14 @@ Give every event above exactly one disposition:
 - `keep_deferred` — still not worth acting on, and not yet safe to retire. Give
   the reason as it stands now, not a copy of the old one, and say what would
   change it.
+
+Two more tools act on your own schedule rather than on events, and count toward
+no event's disposition:
+
+- `schedule_check_in` — be woken in so many minutes with a note to yourself, when
+  something is expected sooner than the next scheduled pass.
+- `set_heartbeat_interval` — for a while, run passes more (or less) often than the
+  standing schedule; it lapses on its own.
 
 Guidance:
 

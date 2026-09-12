@@ -13,6 +13,7 @@ from mcp.server import MCPServer
 
 from .agents import Agent
 from .config import Effort
+from .heartbeats import CheckIn, HeartbeatSummary
 from .store import EventRow
 from .tools import Disposition, Dispatcher, mcp_tools
 
@@ -25,6 +26,9 @@ class PassResult:
     considered: list[EventRow]
     dispositions: list[Disposition]
     agent: Agent
+    #: The notes this pass was woken with, and the schedules it wrote.
+    check_ins: tuple[CheckIn, ...] = ()
+    scheduled: tuple[HeartbeatSummary, ...] = ()
 
     @property
     def dispatched_ids(self) -> set[int]:

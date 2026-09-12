@@ -6,9 +6,12 @@ attribution points at. `streams` is the ongoing loci events belong to, each
 routed to at most one `contexts` row: the conversation an agent is having there,
 stored as `turns`. `memory_entries` are the pages of the character's memory and
 `memory_versions` everything that has ever been true of them; `known_people` and
-`person_names` say whose profile a page is and which handles are theirs. Rows
-are never deleted — archiving stamps `archived_at`, deleting a page appends a
-tombstone, and every default query filters those out, so the trail stays intact.
+`person_names` say whose profile a page is and which handles are theirs.
+`heartbeats` is when each loop-driven role runs a pass, and `heartbeat_ticks`
+the append-only record of when each schedule was next due and when it fired.
+Rows are never deleted — archiving stamps `archived_at`, deleting a page appends
+a tombstone, and every default query filters those out, so the trail stays
+intact.
 """
 
 from __future__ import annotations
@@ -32,6 +35,7 @@ from sqlalchemy import (
     UniqueConstraint,
     event,
     select,
+    text,
 )
 from sqlalchemy import Enum as SAEnum
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -445,6 +449,111 @@ class PersonNameRow(Base):
 
     def __repr__(self) -> str:
         return f"PersonNameRow({self.venue}/{self.username} -> person {self.person_id})"
+
+
+class HeartbeatRow(Base):
+    """A schedule on which a role's loop runs a pass.
+
+    One primitive for three things. The standing schedule is recurring, never
+    expires, carries no message and is the loop's own (`created_by` NULL). A
+    temporary override is recurring with `expires_at`. A check-in is one-shot,
+    `interval_seconds` NULL, and carries the note a pass left for a later one.
+
+    The row says how often; *when* lives in `heartbeat_ticks`. A schedule is
+    live iff it has an unfired tick, so ending one means firing its last tick
+    with no successor — never deleting or flagging the row, so what was
+    scheduled and by whom stays on record.
+    """
+
+    __tablename__ = "heartbeats"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+
+    #: Whose pass this schedules. Not the creator's role: `everyone` lets a
+    #: triage agent schedule the sweep.
+    role: Mapped[AgentRole] = mapped_column(
+        SAEnum(AgentRole, native_enum=False, length=16)
+    )
+    #: NULL is one-shot: fired once, when due, never re-timed.
+    interval_seconds: Mapped[float | None] = mapped_column(default=None)
+    #: What the pass that fires this is told. The standing schedule has none.
+    message: Mapped[str | None] = mapped_column(default=None)
+    #: A recurring schedule gets no successor tick that would fall past this.
+    expires_at: Mapped[datetime | None] = mapped_column(default=None)
+
+    #: The agent whose tool call wrote this; NULL is the operator, which
+    #: includes `watch` declaring the standing schedule from config.
+    created_by: Mapped[str | None] = mapped_column(
+        ForeignKey("agents.id"), default=None
+    )
+    #: Joined, as `ContextRow.actor` is: rows are rendered after their session
+    #: is gone, and the label needs the creator's role.
+    creator: Mapped[AgentRow | None] = relationship(lazy="joined")
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+    @property
+    def recurring(self) -> bool:
+        return self.interval_seconds is not None
+
+    @property
+    def standing(self) -> bool:
+        """The loop's own rhythm: recurring, open-ended, silent, nobody's."""
+        return (
+            self.recurring
+            and self.expires_at is None
+            and self.message is None
+            and self.created_by is None
+        )
+
+    @property
+    def agent(self) -> Agent | None:
+        return self.creator.to_agent() if self.creator else None
+
+    def __repr__(self) -> str:
+        every = f"every {self.interval_seconds:g}s" if self.recurring else "once"
+        return f"HeartbeatRow(id={self.id}, role={self.role.value}, {every})"
+
+
+class HeartbeatTickRow(Base):
+    """When a schedule next fires, and when it did. Append-only.
+
+    A schedule has at most one unfired tick; the partial unique index says so,
+    so a bug that inserted a second fails loudly rather than doubling a pass.
+    Firing stamps the tick and, for a recurring schedule, inserts the successor
+    in the same transaction. A tick fired before it was due is the record of a
+    shift: an immediate arrival or a check-in brought the pass forward.
+    """
+
+    __tablename__ = "heartbeat_ticks"
+    __table_args__ = (
+        Index(
+            "uq_heartbeat_ticks_live",
+            "heartbeat_id",
+            unique=True,
+            sqlite_where=text("fired_at IS NULL"),
+        ),
+        # The loop's one read is the earliest unfired tick; fired ones pile up
+        # beneath it, one per pass, forever.
+        Index("ix_heartbeat_ticks_due", "due_at", sqlite_where=text("fired_at IS NULL")),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    heartbeat_id: Mapped[int] = mapped_column(ForeignKey("heartbeats.id"))
+    #: Joined: a tick is read to act on its schedule, after the session is gone.
+    schedule: Mapped[HeartbeatRow] = relationship(lazy="joined")
+
+    due_at: Mapped[datetime]
+    fired_at: Mapped[datetime | None] = mapped_column(default=None)
+
+    @property
+    def live(self) -> bool:
+        return self.fired_at is None
+
+    def __repr__(self) -> str:
+        when = f"due {self.due_at.isoformat(timespec='seconds')}"
+        if self.fired_at is not None:
+            when += f", fired {self.fired_at.isoformat(timespec='seconds')}"
+        return f"HeartbeatTickRow(id={self.id}, heartbeat_id={self.heartbeat_id}, {when})"
 
 
 async def resolve_stream(session: AsyncSession, ref: StreamRef) -> int:

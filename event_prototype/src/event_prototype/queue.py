@@ -12,17 +12,19 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import TracebackType
 from typing import Self
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
+from sqlalchemy.orm import aliased, contains_eager
 
 from .agents import Agent, AgentRole
 from .contexts import Turn
 from .events import Event, MessageEvent, Priority, check_priority
+from .heartbeats import Beat, CheckIn, HeartbeatSummary
 from .memory import MemoryStore
 from .people import PeopleStore, Profile, profiles_for
 from .render import PromptRenderer
@@ -31,6 +33,8 @@ from .store import (
     ActionRow,
     ContextRow,
     EventRow,
+    HeartbeatRow,
+    HeartbeatTickRow,
     Status,
     StreamNotFound,
     StreamRow,
@@ -97,6 +101,10 @@ class Assignment:
     #: someone known. Resolved with the assignment, so the subagent is shown
     #: who it is talking to without a lookup of its own.
     people: dict[int, Profile] = field(default_factory=lambda: {})
+
+
+def _earliest(known: datetime | None, candidate: datetime) -> datetime:
+    return candidate if known is None or candidate < known else known
 
 
 class EventQueue:
@@ -433,7 +441,9 @@ class EventQueue:
     #
     # Wakes fire after the transaction block has exited, never inside it, so a
     # write that rolls back wakes nobody. Only `submit` and `escalate` wake:
-    # they are the two ways an event enters the pending set.
+    # they are the two ways an event enters the pending set. The heartbeat
+    # writes below wake nobody either: a schedule is only ever written from
+    # inside a pass, and the loop re-reads the schedule when the pass ends.
 
     @asynccontextmanager
     async def subscribe(self, label: str) -> AsyncGenerator[Subscription]:
@@ -448,15 +458,197 @@ class EventQueue:
         """Who is listening, by label."""
         return self._notifier.labels()
 
-    async def pending_count(self) -> int:
-        """How many events triage would see. One query."""
+    async def workload(self, role: AgentRole) -> int:
+        """How many events a pass for `role` would see: pending for triage,
+        deferred for the sweep. One query."""
+        match role:
+            case AgentRole.TRIAGE:
+                status = Status.PENDING
+            case AgentRole.SWEEP:
+                status = Status.DEFERRED
+            case _:
+                raise ValueError(f"{role.value} runs no pass, so has no workload")
         query = select(func.count(EventRow.id)).where(
-            EventRow.status == Status.PENDING, EventRow.archived_at.is_(None)
+            EventRow.status == status, EventRow.archived_at.is_(None)
         )
         async with self._sessions() as session:
             return (await session.execute(query)).scalar_one()
 
+    # -- heartbeats --------------------------------------------------------
+    #
+    # A schedule is a `HeartbeatRow`; when it next fires is its one unfired
+    # `HeartbeatTickRow`. Every write here is one transaction, and every read
+    # one statement.
+
+    async def schedule_heartbeat(
+        self,
+        role: AgentRole,
+        *,
+        due_at: datetime,
+        interval_seconds: float | None = None,
+        message: str | None = None,
+        expires_at: datetime | None = None,
+        created_by: Agent | None = None,
+    ) -> HeartbeatSummary:
+        """Add a schedule for `role` and its first tick.
+
+        `interval_seconds` None is a one-shot check-in, fired once when due.
+        A recurring schedule is re-timed from every pass of its role (see
+        `beat`), so `due_at` here is only the first tick.
+        """
+        async with self._sessions.begin() as session:
+            schedule = HeartbeatRow(
+                role=role,
+                interval_seconds=interval_seconds,
+                message=message,
+                expires_at=expires_at,
+                created_by=created_by.id if created_by else None,
+            )
+            session.add(schedule)
+            await session.flush()  # for its id
+            session.add(HeartbeatTickRow(heartbeat_id=schedule.id, due_at=due_at))
+            await session.flush()
+            return await self._summary(session, schedule.id)
+
+    async def ensure_standing(self, role: AgentRole, interval_seconds: float) -> HeartbeatSummary:
+        """The standing schedule for `role` — recurring, open-ended, silent,
+        nobody's — at `interval_seconds`, made if missing.
+
+        A live standing schedule at a different interval is ended (its tick
+        fired now, no successor) and a fresh one inserted due now, so a config
+        change shows up as two rows rather than an edited one. Overrides and
+        check-ins are not touched.
+        """
+        now = utcnow()
+        async with self._sessions.begin() as session:
+            kept: HeartbeatRow | None = None
+            for tick in (await session.scalars(self._live_ticks(role))).all():
+                schedule = tick.schedule
+                if not schedule.standing:
+                    continue
+                if kept is None and schedule.interval_seconds == interval_seconds:
+                    kept = schedule
+                else:
+                    tick.fired_at = now
+            if kept is None:
+                kept = HeartbeatRow(role=role, interval_seconds=interval_seconds)
+                session.add(kept)
+                await session.flush()  # for its id, and so the ended ticks
+                # are stamped before a live one is added beside them
+                session.add(HeartbeatTickRow(heartbeat_id=kept.id, due_at=now))
+            await session.flush()
+            return await self._summary(session, kept.id)
+
+    async def beat(self, role: AgentRole, *, at: datetime) -> Beat:
+        """A pass for `role` is happening at `at`: fire what is due, re-time what recurs.
+
+        Every unfired tick of the role's schedules with `due_at <= at` fires,
+        and its message goes into the returned `Beat`. Every live recurring
+        schedule, due or not, fires its tick and gets a successor at
+        `at + interval` — or none if that would pass `expires_at`, which is
+        how an override ends. A check-in not yet due is left for its time.
+
+        Called before the pass, not after, so the successor is timed from
+        when the pass began: a pass longer than its interval is followed at
+        once by another.
+        """
+        check_ins: list[CheckIn] = []
+        successors: list[HeartbeatTickRow] = []
+        due = False
+        next_due: datetime | None = None
+        async with self._sessions.begin() as session:
+            for tick in (await session.scalars(self._live_ticks(role))).all():
+                schedule = tick.schedule
+                is_due = tick.due_at <= at
+                if not is_due and not schedule.recurring:
+                    next_due = _earliest(next_due, tick.due_at)
+                    continue
+                tick.fired_at = at
+                if is_due:
+                    due = True
+                    if schedule.message is not None:
+                        check_ins.append(
+                            CheckIn(schedule.message, schedule.agent, schedule.created_at, tick.due_at)
+                        )
+                if schedule.interval_seconds is not None:
+                    successor = at + timedelta(seconds=schedule.interval_seconds)
+                    if schedule.expires_at is None or successor <= schedule.expires_at:
+                        successors.append(HeartbeatTickRow(heartbeat_id=schedule.id, due_at=successor))
+                        next_due = _earliest(next_due, successor)
+            # The stamps go out before the successors: the unit of work would
+            # otherwise insert first, and the live-tick index refuses two.
+            await session.flush()
+            session.add_all(successors)
+        return Beat(role, at, tuple(check_ins), due, next_due)
+
+    async def next_heartbeat_due(self, roles: Sequence[AgentRole]) -> dict[AgentRole, datetime]:
+        """When each of `roles` is next due, for those with anything live. One query.
+
+        Per role rather than one minimum, so the loop can both sleep until
+        the earliest and, on waking, tell which roles it was for.
+        """
+        query = (
+            select(HeartbeatRow.role, func.min(HeartbeatTickRow.due_at))
+            .join(HeartbeatRow, HeartbeatRow.id == HeartbeatTickRow.heartbeat_id)
+            .where(HeartbeatTickRow.fired_at.is_(None), HeartbeatRow.role.in_(roles))
+            .group_by(HeartbeatRow.role)
+        )
+        async with self._sessions() as session:
+            return {role: due for role, due in (await session.execute(query)).tuples()}
+
+    async def heartbeats(self) -> list[HeartbeatSummary]:
+        """Every live schedule with its next due, soonest first. One query."""
+        async with self._sessions() as session:
+            rows = (await session.execute(self._summaries_query())).all()
+        return [
+            HeartbeatSummary(schedule, next_due, fired, last_fired_at)
+            for schedule, next_due, fired, last_fired_at in rows
+        ]
+
     # -- internals ---------------------------------------------------------
+
+    @staticmethod
+    def _live_ticks(role: AgentRole):
+        """The role's unfired ticks with their schedules, soonest first."""
+        return (
+            select(HeartbeatTickRow)
+            .join(HeartbeatTickRow.schedule)
+            .options(contains_eager(HeartbeatTickRow.schedule))
+            .where(HeartbeatTickRow.fired_at.is_(None), HeartbeatRow.role == role)
+            .order_by(HeartbeatTickRow.due_at.asc(), HeartbeatTickRow.id.asc())
+        )
+
+    @staticmethod
+    def _summaries_query():
+        """Live schedules with their next due and firing history, soonest first.
+
+        The count is aggregated apart from the join to the live tick, as the
+        turn count is in `list_streams`, so the eager creator columns need no
+        GROUP BY and the join cannot multiply.
+        """
+        fired = (
+            select(
+                HeartbeatTickRow.heartbeat_id,
+                func.count(HeartbeatTickRow.id).label("fired"),
+                func.max(HeartbeatTickRow.fired_at).label("last_fired_at"),
+            )
+            .where(HeartbeatTickRow.fired_at.is_not(None))
+            .group_by(HeartbeatTickRow.heartbeat_id)
+            .subquery()
+        )
+        live = aliased(HeartbeatTickRow)
+        return (
+            select(HeartbeatRow, live.due_at, func.coalesce(fired.c.fired, 0), fired.c.last_fired_at)
+            .join(live, (live.heartbeat_id == HeartbeatRow.id) & live.fired_at.is_(None))
+            .outerjoin(fired, fired.c.heartbeat_id == HeartbeatRow.id)
+            .order_by(live.due_at.asc(), HeartbeatRow.id.asc())
+        )
+
+    async def _summary(self, session: AsyncSession, schedule_id: int) -> HeartbeatSummary:
+        """One live schedule's summary, from within the caller's transaction."""
+        query = self._summaries_query().where(HeartbeatRow.id == schedule_id)
+        schedule, next_due, fired, last_fired_at = (await session.execute(query)).one()
+        return HeartbeatSummary(schedule, next_due, fired, last_fired_at)
 
     @staticmethod
     def _events_query(*, active_only: bool = True):
