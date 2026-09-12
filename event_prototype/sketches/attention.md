@@ -74,23 +74,35 @@ cached. The same rule applies to batch assignments and to the thread's claims,
 since both append event turns the same way. A one-shot subagent has no context
 to compare against, so it is shown every known sender's profile, as now.
 
-The turn records what it presented:
+The turn's content stays verbatim: the profile text is pasted into it, because
+the content is the record of what the API was sent and a placeholder filled at
+replay would either pin the version, which gains nothing over the copy, or
+substitute the page's head, which changes the cached prefix and loses what the
+agent saw. What the copy lacks is provenance, and a join table supplies it:
 
 ```python
-class TurnRow(Base):
-    ...
-    #: The memory version this turn presented as the sender's profile, if it
-    #: presented one. The person is reachable through the version's entry,
-    #: which is their root page.
-    profile_version_id: Mapped[int | None] = mapped_column(
-        ForeignKey("memory_versions.id"), default=None
+class MemoryTransclusionRow(Base):
+    """A memory version whose text a turn included, pasted in full."""
+
+    __tablename__ = "memory_transclusions"
+
+    #: Composite key, `turn_id` leading, so this is also the index on
+    #: `turn_id` that every read needs: the reads start from a context's
+    #: turns and ask what each included. Nothing looks up by version.
+    turn_id: Mapped[int] = mapped_column(ForeignKey("turns.id"), primary_key=True)
+    version_id: Mapped[int] = mapped_column(
+        ForeignKey("memory_versions.id"), primary_key=True
     )
 ```
 
-The people already presented in a context are one query: the persons whose
-root entry has a version referenced by a turn of that context. Recording the
-version rather than the person keeps one fact in one place, since the version
-determines the person, and it also records exactly which text the agent saw.
+It references versions rather than entries: the version determines the entry
+and records exactly which text was shown. A turn can include several pages,
+as a merged batch with two senders does, and the table is not specific to
+profiles; any page the harness pastes into a turn is recorded the same way,
+so implicit recall, when it arrives, records what it surfaced in the same
+place, and "already shown in this context" is one query for both. That query
+joins the context's turns to their transclusions, the versions to their
+entries, and the entries to the people whose root page they are.
 
 When events are appended to a context, in `assign` and in the thread, the
 batch's senders are looked up as now, the people already presented in the
@@ -292,7 +304,8 @@ with a conversational agent, the `ACQUIRE` row commits, the dispatcher claims
 Alice's message for the thread, and the queue wakes with `Shifted`. The thread
 reads the focus and claims the message with an `ATTEND`. Alice's handle is
 linked to a known person and nothing has been presented in this new context,
-so the event turn opens with her profile and records the version shown. The
+so the event turn opens with her profile, with a transclusion row naming the
+version shown. The
 thread appends that turn and the live brief, runs the conversational agent at
 low effort with `yield_focus` available, appends the reply, and completes the
 event with the reply as its report. No other loop makes routing decisions, so
@@ -348,7 +361,8 @@ alone; a release with everything completed returns nothing; `shift` wakes
 subscribers with `Shifted` after commit and not on rollback; the idle
 heartbeat releases only with nothing pending and no reply owed; a stale focus
 is released on startup. For profiles: the first event from a known sender in
-a context carries their profile and the turn records the version; a second
+a context carries their profile and a transclusion row for the version; a
+second
 event from them does not; a batch with two events from one person presents
 the profile once; a one-shot subagent is shown it on every event; a person
 linked after their first event is presented with their next; the thread's
@@ -365,7 +379,7 @@ much is left when it decides whether to divert. Liveness: the lease described
 above. A message between contexts, which the same-person-elsewhere case needs.
 A release tool for triage, for a live context that is holding the thread on a
 conversation not worth answering; the idle timeout covers this for now.
-Re-presenting a profile whose page has changed since it was shown; the version
-id on the turn makes that a comparison against the page's head, but nothing
+Re-presenting a profile whose page has changed since it was shown; the
+transclusion row makes that a comparison against the page's head, but nothing
 does it yet. And latency from memory tool calls inside the live loop; the
 brief asks for the reply first, and the iteration cap bounds the rest.
