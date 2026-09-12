@@ -24,7 +24,8 @@ uv run python -m event_prototype memory ls      # the memory directory, as the t
 uv run python -m event_prototype memory cat /memories/people/mira.md
 uv run python -m event_prototype memory log /memories/people/mira.md   # every version: when, who, how
 uv run python -m event_prototype people         # everyone known, with their handles
-uv run python -m event_prototype link discord ines Ines
+uv run python -m event_prototype register Ines --handle discord/ines --notes "Asked about the brush pack."
+uv run python -m event_prototype link email ines@example.org Ines   # another handle of hers
 echo "# Notes" | uv run python -m event_prototype memory put /memories/notes.md   # a page, written by you
 ```
 
@@ -246,10 +247,13 @@ person. When events are assigned, their senders are looked up in one query and
 each known sender's profile rides along, so the event turn the subagent reads
 carries a `<sender>` element with the person's name, the path of their page and
 its current text inline. Recall costs no round trip; the path is there for when
-the page has been edited since. The subagent has one tool besides memory,
-`link_person`, for the moment it learns who a handle belongs to: the person and
-their page are created if new, and from then on their profile arrives with every
-message they send. `link` does the same from the command line.
+the page has been edited since. The subagent has two tools besides memory.
+`register_person` brings someone new in: a name, whatever is known so far, and
+a handle if there is one, in one call that scaffolds the page and returns its
+path. `link_person` says that a handle belongs to someone, for a second handle
+or for a person the model wrote a page for before learning who they were; from
+then on their profile arrives with every message they send. `register` and
+`link` do the same from the command line.
 
 The subagent is a tool loop now rather than a single call, and every message of
 it is a turn in the context: the model's reply, the tool results that answer it,
@@ -350,8 +354,8 @@ both passes, but `list --all` still shows it, actions and all.
 
 ## What it doesn't do
 
-Subagents cannot act outside memory: they have the memory tool and
-`link_person` and nothing that sends a message, so they describe how they would
+Subagents cannot act outside memory: they have the memory tool, `register_person`
+and `link_person`, and nothing that sends a message, so they describe how they would
 handle an event rather than doing it. Memory has no search, no fading and no
 dreams; the model finds things by reading the index and the directory, and a
 person is only ever found by a handle that was linked. Contexts only grow: there

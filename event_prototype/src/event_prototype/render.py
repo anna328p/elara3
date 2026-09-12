@@ -179,10 +179,11 @@ class PromptRenderer:
             event=EventView.of(row, now, person=person)
         )
 
-    def person_root(self, name: str, venue: str, username: str) -> str:
-        """A new person's profile page, before anyone has written a thing about them."""
+    def person_root(self, name: str, *, handle: str | None = None, notes: str = "") -> str:
+        """A new person's profile page: the name, the handle if one is known
+        (`venue/username`), and whatever is known so far under Notes."""
         return self._env.get_template("person_root.md.j2").render(
-            name=name, venue=venue, username=username
+            name=name, handle=handle, notes=notes.strip()
         )
 
     def brief(self, instructions: str, *, sequence: bool) -> str:

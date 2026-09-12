@@ -18,9 +18,11 @@ person in their file, about anything else in a file of its own, listed in the
 index. Keep files short and current: edit rather than append, delete what is
 stale, and link between files with relative markdown links.
 
-`link_person` says which handle belongs to whom. Call it when you learn who a
-sender is, from what they say, from context, or because you are told, and their
-profile file will exist at the path it returns; write what you know there.
+`register_person` brings someone new into memory: give their name, what you
+know so far, and a handle if you have one, and their profile file exists at the
+path it returns. `link_person` says that a handle belongs to someone already
+known. Use them when you learn who a sender is, from what they say, from
+context, or because you are told, and write what you learn on their page.
 
 You cannot send messages or act outside memory in this prototype, so describe the
 handling concretely: what you did or would do, and any text you would send on the

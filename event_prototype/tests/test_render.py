@@ -36,7 +36,8 @@ async def test_the_subagent_conversation_splits_into_stable_and_per_turn_parts()
     assert row.description not in system
     assert system == renderer.subagent_system()
     # ...and names the tools, which are the subagent's whole reach.
-    assert "`memory`" in system and "`link_person`" in system and "/memories/MEMORY.md" in system
+    for named in ("`memory`", "`register_person`", "`link_person`", "/memories/MEMORY.md"):
+        assert named in system
     # ...each event is one turn...
     assert f'<event id="{row.id}"' in event
     assert row.description in event

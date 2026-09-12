@@ -270,18 +270,45 @@ def _streams_of(rows: Sequence[EventRow]) -> tuple[str, ...]:
 
 
 def build_subagent_server(people: PeopleStore, agent: Agent) -> MCPServer:
-    """What a subagent can do besides remember: say whose handle a handle is."""
+    """What a subagent can do besides remember: bring someone into memory, and
+    say whose handle a handle is."""
     server = MCPServer("elara-subagent")
+
+    @server.tool(name="register_person")
+    async def _register_person(
+        name: str, notes: str = "", venue: str | None = None, username: str | None = None
+    ) -> str:
+        """Bring a new person into memory: scaffold their profile page and, if
+        you know a handle of theirs, bind it, in one call.
+
+        Use it when you meet someone worth remembering. Nobody by that name may
+        be known already; for someone who is, edit their page or use
+        `link_person`. The reply gives the page's path, which is where to write
+        what you learn about them later.
+
+        Args:
+            name: The person's name, as their profile will be titled.
+            notes: What you know so far; becomes the page's first notes.
+            venue: The medium of a handle you know, as events spell it
+                ("discord", "email"). Give `username` with it.
+            username: Their handle on that venue, as events spell the sender.
+        """
+        if (venue is None) != (username is None):
+            raise ValueError("Give both venue and username, or neither.")
+        handle = (venue, username) if venue is not None and username is not None else None
+        profile = await people.register(name, notes, handle, agent)
+        return f"{profile.name} is person {profile.id}; their profile is at {profile.path}."
 
     @server.tool(name="link_person")
     async def _link_person(venue: str, username: str, name: str) -> str:
         """Record that a handle belongs to a person, so their profile is shown
         with every message they send from now on.
 
-        Call it when you learn who a sender is — from what they say, from
-        context, or because you are told. If nobody by that name is known yet,
-        they and their profile file are created; if the handle is already
-        someone else's, the call is refused and says whose it is.
+        Call it when you learn that a handle belongs to someone you already
+        know, or to add a second handle. If nobody by that name is known yet,
+        they and their profile file are created (with nothing in it: prefer
+        `register_person` for that); if the handle is already someone else's,
+        the call is refused and says whose it is.
 
         Args:
             venue: The medium the handle is on, as the event's `venue` spells

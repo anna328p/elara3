@@ -77,6 +77,13 @@ def main() -> None:
 
     sub.add_parser("people", help="everyone the character knows, with their handles")
 
+    register_cmd = sub.add_parser("register", help="bring a new person into memory")
+    register_cmd.add_argument("name", help="the person, as their profile will be titled")
+    register_cmd.add_argument("--notes", default="", help="what is known so far")
+    register_cmd.add_argument(
+        "--handle", metavar="VENUE/USERNAME", help='a handle of theirs: "discord/ines"'
+    )
+
     link_cmd = sub.add_parser("link", help="say which handle belongs to whom")
     link_cmd.add_argument("venue", help='the medium, as events spell it: "discord"')
     link_cmd.add_argument("username", help="the handle, as events spell the sender")
@@ -116,6 +123,8 @@ async def _dispatch(args: argparse.Namespace, config: Config) -> None:
             await _memory(config, args)
         case "people":
             await _people(config)
+        case "register":
+            await _register(config, args.name, args.notes, args.handle)
         case "link":
             await _link(config, args.venue, args.username, args.name)
         case unknown:  # argparse rejects anything else first
@@ -232,6 +241,17 @@ async def _people(config: Config) -> None:
             f"[{person.id:>3}] {person.name:<20} {person.root.path:<36} "
             f"{', '.join(handles) or '—'}"
         )
+
+
+async def _register(config: Config, name: str, notes: str, handle: str | None) -> None:
+    venue, _, username = handle.partition("/") if handle else ("", "", "")
+    if handle and not (venue and username):
+        raise SystemExit(f"error: a handle is VENUE/USERNAME, not {handle!r}")
+    async with await EventQueue.open(config.db_path) as queue:
+        profile = await queue.people.register(
+            name, notes, (venue, username) if handle else None, None
+        )
+    print(f"{profile.name} is person {profile.id}; profile at {profile.path}")
 
 
 async def _link(config: Config, venue: str, username: str, name: str) -> None:

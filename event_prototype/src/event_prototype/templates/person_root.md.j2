@@ -1,6 +1,11 @@
 # {{ name }}
+{% if handle %}
 
-Known as {{ venue }}/{{ username }}.
+Known as {{ handle }}.
+{% endif %}
 
 ## Notes
 
+{% if notes %}
+{{ notes }}
+{% endif %}
