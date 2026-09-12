@@ -33,8 +33,8 @@ received it. The event is never `PENDING`, so it is not in triage's pending
 list, not counted by `pending_count`, and never the sweep's. Triage sees it
 under its context, below, and can act on it there. Its turn is not appended
 yet: turns are the record of what the agent was shown, and an agent whose
-call is in flight has not been shown this event. Whichever executor next runs
-the context appends the turn then.
+call is in flight has not been shown this event. The runner appends the turn
+when it next runs the context.
 
 `ASSIGNED` is a fourth status, set here and by `assign`. `record_failure` sets
 events back to `PENDING` instead of leaving them unchanged, and `Action` gains
@@ -47,11 +47,17 @@ runner on the memory branch stores each tool result before the next request,
 so a context left there ends on a user turn and `to_api` can send it again.
 Both are one query over `events` and `turns`.
 
-A context is run by one executor at a time. The queue holds an in-process
-`asyncio.Lock` per context, taken by whoever runs it: the runner for a live
-or heartbeat run, the dispatcher for a batch assignment. `assign` refuses an
-assignment that would route into the live context, with an error the triage
-model can read.
+Assignment is delivery too. When triage hands events to a context, `assign`
+sets them to `ASSIGNED` with the brief on the action, as now, and wakes the
+runner instead of spawning a task; the runner appends the events and the
+brief and runs the context. That holds for the live context as well: a brief
+handed into a live conversation is turned at its next run, which is how
+triage tells it that the job it was asked about has reported. The dispatcher
+runs only one-shot subagents, the events that belong to no context. So every
+context has one executor, the runner, which holds an in-process
+`asyncio.Lock` per context for the runs it starts in parallel at a heartbeat.
+A pass ends when its decisions are recorded; the reports of context runs
+arrive later, and `attend` prints them as they land.
 
 ## The conversational agent
 
@@ -94,10 +100,10 @@ event.
 In a conversational agent's context, a person's profile is presented once: with
 the first event from them in that context, and not with later ones. The
 context keeps every turn, so the agent has already read the profile, and
-repeating it adds tokens to a prefix that would otherwise be cached. The rule
-is applied wherever event turns are appended, by the runner and by the
-dispatcher. A one-shot subagent has no context to compare against, so it is
-shown every known sender's profile, as now.
+repeating it adds tokens to a prefix that would otherwise be cached. The
+runner applies the rule whenever it appends event turns. A one-shot subagent,
+which the dispatcher runs, has no context to compare against, so it is shown
+every known sender's profile, as now.
 
 The turn's content stays verbatim: the profile text is pasted into it, because
 the content is the record of what the API was sent, and a placeholder filled at
@@ -168,10 +174,10 @@ it. No column marks it; the triage prompt derives it when it lists that
 context, below.
 
 `EventQueue.focus()` returns the current row or `None`. `shift()` appends a row
-and, after the commit, wakes subscribers with a `Shifted`, a third kind of wake
-alongside `Arrived` and `Heartbeat`. `Arrived` gains the context the event was
-delivered to, or `None` when it went to triage, since that is part of why the
-wake fired.
+and, after the commit, wakes subscribers with a `Shifted`. `assign` wakes with
+an `Assigned` the same way. Both are new kinds of wake alongside `Arrived` and
+`Heartbeat`, and `Arrived` gains the context the event was delivered to, or
+`None` when it went to triage, since that is part of why the wake fired.
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -182,18 +188,27 @@ class Shifted:
     context_id: int | None
     at: datetime
 
-type Wake = Arrived | Heartbeat | Shifted
+@dataclass(frozen=True, slots=True)
+class Assigned:
+    """Triage handed events to a context, with a brief."""
+
+    context_id: int
+    event_ids: tuple[int, ...]
+    at: datetime
+
+type Wake = Arrived | Heartbeat | Shifted | Assigned
 ```
 
 ## The runner
 
 The runner is a loop in `attention.py`, subscribed to the queue alongside
 `watch`. It runs contexts that owe a call. Running a context means: take its
-lock; append a turn for each delivered event without one, with profiles as
-above, and a brief, `live.md.j2` if the context is live and `heartbeat.md.j2`
-otherwise; run the agent's tool loop as the dispatcher does, storing every
-message; complete the events with the final reply as their report; release the
-lock. A live run uses `live_effort`; a heartbeat run uses `subagent_effort`.
+lock; append a turn for each delivered or assigned event without one, with
+profiles as above, followed by triage's brief if the events carry one and
+otherwise by `live.md.j2` if the context is live and `heartbeat.md.j2` if
+not; run the agent's tool loop, storing every message; complete the events
+with the final reply as their report; release the lock. A live run uses
+`live_effort`; any other run uses `subagent_effort`.
 Both use the agent's tools, `memory` and `link_person`, and a live run of a
 conversational agent also offers `yield_focus(reason)`.
 
@@ -203,14 +218,17 @@ An `Arrived` delivered to the live context: run it now. Arrivals during a run
 are turned at the next run, so a burst becomes one call, and `to_api` merges
 them into one user message.
 
+An `Assigned`, the wake `assign` sends, naming the context: run it now,
+whether or not it is live. This is the fourth kind of wake.
+
 A `Shifted`: if the focus moved to a context that owes a call, run it now. The
 previous context is left as it is; anything it owes is served at the heartbeat
 or when attention returns.
 
 A `Heartbeat` of `context_heartbeat_seconds`: run every context that owes a
-call and is not live, as parallel tasks, the way the dispatcher runs
-assignments. Async arrivals wait for this, and so does an active arrival that
-triage chose not to divert to.
+call and is not live, as parallel tasks. Async arrivals wait for this, and so
+does an active arrival that triage neither diverted to nor handed on with a
+brief.
 
 After a live run, the runner decides whether the context still holds the
 runner. A subagent's context is released as soon as its loop ends owing
@@ -245,15 +263,21 @@ iterations of a loop shows how many iterations it has run.
 
 Triage acts on both. Its event tools take delivered events as well as
 pending ones, by the ids the block lists. `handle_one_event` on a delivered
-event runs its context now with the brief, through the dispatcher, instead of
-leaving it for the heartbeat; it is refused when the context is live, since
-the runner has it. `handle_event_sequence` can mix pending and delivered
-events, routed as before, which is how a job's pending result is handed into
-the conversation it answers. `defer_event` takes pending events only: a
-delivered event that triage does not act on is answered at its context's
-heartbeat, which is what deferring it would mean. The rule that every event
-id must appear in exactly one call covers the pending list; delivered events
-are optional to act on.
+event has the runner run its context now with the brief instead of leaving it
+for the heartbeat, and the live context is no exception. `handle_event_sequence`
+routes as before, to the one context every event in it belongs to or, when
+their streams share none, to a one-shot subagent; a delivered event already
+belongs to its context, so a sequence containing one must route there, which
+is the case of a stream carrying both a `background` event and an `active`
+one. Both tools take an optional `context_id` that delivers the events into
+that context instead of the one their streams route to. That is how a job's
+pending result is handed into the conversation that asked for it, and it is
+the message between contexts in its cheapest form: an event has one context,
+so the job's own context does not see the result. `defer_event` takes pending
+events only: a delivered event that triage does not act on is answered at its
+context's heartbeat, which is what deferring it would mean. The rule that
+every event id must appear in exactly one call covers the pending list;
+delivered events are optional to act on.
 
 Triage also gets one more tool. `divert_attention(context_id, reason)` makes
 that context live: an `ACQUIRE` if nothing was live and a `PREEMPT` otherwise.
@@ -349,11 +373,11 @@ the room's context, opened now with a conversational agent. `watch` runs a
 pass. The block shows Alice's context live with no reply owed and the last
 event twenty seconds ago, and the room's context waiting with Bob's message.
 The pass does not divert. It calls `handle_one_event` on Bob's event with a
-brief saying the character is talking to Alice at the moment, and the
-dispatcher runs the room's context now; Bob's profile opens the turn if his
-handle is linked, and his reply arrives within a minute. Had the pass left
-the event alone, the runner would have run the room's context at the next
-context heartbeat instead.
+brief saying the character is talking to Alice at the moment; the `Assigned`
+wake has the runner run the room's context now, with Bob's profile opening
+the turn if his handle is linked, and his reply arrives within a minute. Had
+the pass left the event alone, the runner would have run the room's context
+at the next context heartbeat instead.
 
 Alice writes goodnight. Her agent replies and calls `yield_focus`. A
 `RELEASE` attributed to her agent commits, and the `Shifted` makes `watch` run
@@ -375,9 +399,11 @@ submit sets the event to `ASSIGNED` with a `DELIVERED` action and leaves it
 out of `triage_view` and `pending_count`; a context with a delivered event
 owes a call, and so does one whose last turn is a user turn; running a context
 appends one turn per delivered event and completes them; `assign` accepts a
-delivered event and runs its context, and raises for the live context;
-`defer` refuses a delivered event; `divert_attention` on the live context is
-refused; a
+delivered event, wakes the runner with `Assigned`, and spawns nothing for a
+context, including the live one; `assign` with a `context_id` delivers into
+that context; a sequence holding a delivered event routes to its context or
+is refused; `defer` refuses a delivered event; `divert_attention` on the live
+context is refused; a
 `PREEMPT` leaves the previous context's turns and delivered events as they
 are; a subagent context is released when its loop ends owing nothing; a
 conversational context is released on yield and on the idle timeout, and not
@@ -397,8 +423,10 @@ with the fixture events and asserts the resulting shift history.
 Budget: the architecture reserves quota for live exchanges that the rest of
 the system cannot use. The runner should meter against it, and triage should
 be told how much is left when it decides whether to divert. Liveness: the
-lease described above. A message between contexts, which the same person
-writing from a second place needs. Re-presenting a profile whose page has
+lease described above. A message between contexts that both contexts see;
+the `context_id` on the event tools moves one event into one context, and the
+same person writing from a second place needs more than that. Re-presenting
+a profile whose page has
 changed since it was shown; the transclusion row makes that a comparison
 against the page's head, but nothing does it yet. And the summary line's
 quality:
